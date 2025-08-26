@@ -59,7 +59,8 @@ class AscendScheduler(Scheduler):
 
     def schedule(self) -> SchedulerOutput:
         if self.scheduler_config.chunked_prefill_enabled:
-            assert self.cp_size == 1 and self.sp_size == 1
+            # 允许 CP + chunked prefill：调度仍沿用上游逻辑，
+            # 真正的上下文分块累加在 attention 中处理。
             return super().schedule()
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
