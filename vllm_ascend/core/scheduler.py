@@ -65,9 +65,7 @@ class AscendScheduler(Scheduler):
             assert not self.cache_config.enable_prefix_caching  #暂不兼容 prefix cache
 
     def schedule(self) -> SchedulerOutput:
-        if self.scheduler_config.chunked_prefill_enabled:
-            assert self.cp_size == 1 and self.sp_size == 1
-            return super().schedule()
+        chunked_prefill = self.scheduler_config.chunked_prefill_enabled
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -147,27 +145,60 @@ class AscendScheduler(Scheduler):
                 num_computed_tokens = request.num_computed_tokens
 
             # 匹配完prefix之后再进行序列切分
-            # 序列切分 只为分配block 后续还是采用全量的序列长度传入worker  worker自己做切分  尽量不改动state内容
+            # Ascend CP/SP: 为分配 block，同时在 chunked prefill 模式下，按剩余 token 与 token_budget 拆分。
             if self.cp_size * self.sp_size > 1:
-                # block_size align
-                num_total_blocks = cdiv((request.num_tokens - num_computed_tokens), self.block_size)
-
-                num_blocks_of_cp_sp = np.array([num_total_blocks // (self.cp_size * self.sp_size)] * self.cp_size * self.sp_size)
-                remain_blocks = num_total_blocks % (self.cp_size * self.sp_size)
-                for i in range(remain_blocks):
-                    num_blocks_of_cp_sp[i] += 1
-                num_blocks_of_cp_sp = num_blocks_of_cp_sp.reshape(self.cp_size, self.sp_size)
-                request.num_blocks_of_cp_sp = num_blocks_of_cp_sp
-
-                # 分block时采用正常顺序切分，保证正常顺序且block对齐存储kv
-                start_id = 0
-                request.token_ids_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
-                request.num_computed_tokens_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
-                for i in range(self.cp_size):
-                    for j in range(self.sp_size):
-                        request.token_ids_of_cp_sp[i][j] = request.all_token_ids[start_id:start_id+request.num_blocks_of_cp_sp[i][j]*self.block_size]
-                        request.num_computed_tokens_of_cp_sp[i][j] = len(request.token_ids_of_cp_sp[i][j]) + num_computed_tokens     #  实际存kv cache的数量，不包含pad，用于prefill slot计算，decode分配block和slot计算
-                        start_id += request.num_blocks_of_cp_sp[i][j] * self.block_size
+                remaining_tokens = request.num_tokens - num_computed_tokens
+                if remaining_tokens <= 0:
+                    skip_cur_request()
+                    continue
+                if chunked_prefill:
+                    # 每步最多调度 token_budget 个 token
+                    num_new_tokens = min(remaining_tokens, token_budget)
+                    # 仅切分本 step 的 chunk（从已计算前缀处开始）
+                    start_token = num_computed_tokens
+                    end_token = num_computed_tokens + num_new_tokens
+                    chunk_token_ids = request.all_token_ids[start_token:end_token]
+                    # block 对齐后按 cp*sp 均分
+                    num_total_blocks = cdiv(num_new_tokens, self.block_size)
+                    flat = [num_total_blocks // (self.cp_size * self.sp_size)] * (self.cp_size * self.sp_size)
+                    remain_blocks = num_total_blocks % (self.cp_size * self.sp_size)
+                    for i in range(remain_blocks):
+                        flat[i] += 1
+                    num_blocks_of_cp_sp = np.array(flat).reshape(self.cp_size, self.sp_size)
+                    request.num_blocks_of_cp_sp = num_blocks_of_cp_sp
+                    # 顺序切分 chunk，计算每 rank 的新 token 与本步需保存的 kv 数
+                    start_id = 0
+                    request.token_ids_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
+                    request.num_computed_tokens_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
+                    for i in range(self.cp_size):
+                        for j in range(self.sp_size):
+                            length = int(num_blocks_of_cp_sp[i][j]) * self.block_size
+                            request.token_ids_of_cp_sp[i][j] = chunk_token_ids[start_id:start_id + length]
+                            request.num_computed_tokens_of_cp_sp[i][j] = len(request.token_ids_of_cp_sp[i][j]) + num_computed_tokens
+                            start_id += length
+                else:
+                    # 非 chunk 模式：按全量剩余长度切分
+                    num_total_blocks = cdiv((request.num_tokens - num_computed_tokens), self.block_size)
+                    num_blocks_of_cp_sp = np.array([num_total_blocks // (self.cp_size * self.sp_size)] * self.cp_size * self.sp_size)
+                    remain_blocks = num_total_blocks % (self.cp_size * self.sp_size)
+                    for i in range(remain_blocks):
+                        num_blocks_of_cp_sp[i] += 1
+                    num_blocks_of_cp_sp = num_blocks_of_cp_sp.reshape(self.cp_size, self.sp_size)
+                    request.num_blocks_of_cp_sp = num_blocks_of_cp_sp
+                    start_id = 0
+                    request.token_ids_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
+                    request.num_computed_tokens_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
+                    for i in range(self.cp_size):
+                        for j in range(self.sp_size):
+                            request.token_ids_of_cp_sp[i][j] = request.all_token_ids[start_id:start_id + request.num_blocks_of_cp_sp[i][j] * self.block_size]
+                            request.num_computed_tokens_of_cp_sp[i][j] = len(request.token_ids_of_cp_sp[i][j]) + num_computed_tokens
+                            start_id += request.num_blocks_of_cp_sp[i][j] * self.block_size
+            elif chunked_prefill:
+                # 非 CP/SP 模式但启用了 chunked prefill：为兼容性初始化必要的属性
+                # 使用单一的 cp=1, sp=1 维度来模拟原有行为
+                request.num_computed_tokens_of_cp_sp = [[num_computed_tokens]]
+                request.token_ids_of_cp_sp = [[[]]]
+                request.num_blocks_of_cp_sp = np.array([[0]])
 
             # P/D: loading remote KV, do not allocate for new work.
             if load_kv_async:
@@ -181,8 +212,13 @@ class AscendScheduler(Scheduler):
                 # `request.num_prompt_tokens` to consider the resumed
                 # requests, which have output tokens.
                 if self.cp_size * self.sp_size > 1:
-                    num_new_tokens = len(request.token_ids_of_cp_sp[0][0])  # 各种校验以及block分配数 都 /cp_size     这里校验用的也是block对齐的长度，实际使用参与计算的长度更合理
+                    if chunked_prefill:
+                        # CP/SP + chunk：按 token_budget 限制每步调度总 token 数
+                        num_new_tokens = min(request.num_tokens - num_computed_tokens, token_budget)
+                    else:
+                        num_new_tokens = len(request.token_ids_of_cp_sp[0][0])
                 else:
+                    # 非 CP/SP：沿用原逻辑
                     num_new_tokens = request.num_tokens - num_computed_tokens
                 max_tokens_in_kvcache = (self.kv_cache_config.num_blocks *
                                          self.block_size)
@@ -266,9 +302,11 @@ class AscendScheduler(Scheduler):
             else:
                 req_to_new_blocks[request.request_id] = new_blocks
             # Update request info.
-            token_budget -= num_new_tokens   # token_budget只减切过的序列长度，减去非block对齐的切分长度更符合设计初衷，这里先按减去block对齐后的长度走
-            if self.cp_size * self.sp_size > 1:
-                num_new_tokens = request.num_tokens - num_computed_tokens   #恢复成正常的序列长度传入worker
+            # 在 chunked prefill 下，按实际下发的 token 数扣减预算
+            token_budget -= num_new_tokens
+            if self.cp_size * self.sp_size > 1 and not chunked_prefill:
+                # 非 chunk 模式仍按原逻辑恢复为全量长度
+                num_new_tokens = request.num_tokens - num_computed_tokens
             num_scheduled_tokens[request.request_id] = num_new_tokens
             request.status = RequestStatus.RUNNING
             request.num_computed_tokens = num_computed_tokens
@@ -280,8 +318,98 @@ class AscendScheduler(Scheduler):
         if skipped_waiting_requests:
             self.waiting.extendleft(skipped_waiting_requests)
 
-        # If no prefill requests are scheduled,
-        # Schedule decode requests next.
+        # 在 chunked prefill 模式下，如果仍有运行中的请求未完成 prefill，
+        # 继续为其分配下一段 prefill chunk（遵循 token_budget）。
+        if chunked_prefill and token_budget > 0:
+            req_index = 0
+            while req_index < len(self.running) and token_budget > 0:
+                request = self.running[req_index]
+                if request.request_id in self.scheduled_req_ids:
+                    req_index += 1
+                    continue
+
+                # 仍处于 prefill（剩余 token > 1）
+                remaining_tokens = request.num_tokens - request.num_computed_tokens
+                if remaining_tokens <= 1:
+                    req_index += 1
+                    continue
+
+                # 仅限额内下发
+                num_new_tokens = min(remaining_tokens, token_budget)
+                prompt_limit = self._get_prompt_limit(request)
+                num_new_tokens = min(num_new_tokens, prompt_limit)
+                if num_new_tokens <= 0:
+                    req_index += 1
+                    continue
+
+                # CP/SP: 为本次 chunk 进行切分与统计
+                if self.cp_size * self.sp_size > 1:
+                    num_computed_tokens = request.num_computed_tokens
+                    start_token = num_computed_tokens
+                    end_token = num_computed_tokens + num_new_tokens
+                    chunk_token_ids = request.all_token_ids[start_token:end_token]
+                    num_total_blocks = cdiv(num_new_tokens, self.block_size)
+                    flat = [num_total_blocks // (self.cp_size * self.sp_size)] * (self.cp_size * self.sp_size)
+                    remain_blocks = num_total_blocks % (self.cp_size * self.sp_size)
+                    for i in range(remain_blocks):
+                        flat[i] += 1
+                    num_blocks_of_cp_sp = np.array(flat).reshape(self.cp_size, self.sp_size)
+                    request.num_blocks_of_cp_sp = num_blocks_of_cp_sp
+                    start_id = 0
+                    request.token_ids_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
+                    request.num_computed_tokens_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
+                    for i in range(self.cp_size):
+                        for j in range(self.sp_size):
+                            length = int(num_blocks_of_cp_sp[i][j]) * self.block_size
+                            request.token_ids_of_cp_sp[i][j] = chunk_token_ids[start_id:start_id + length]
+                            request.num_computed_tokens_of_cp_sp[i][j] = len(request.token_ids_of_cp_sp[i][j]) + num_computed_tokens
+                            start_id += length
+                else:
+                    # 非 CP/SP 模式但在 chunked prefill：更新兼容性属性
+                    request.num_computed_tokens_of_cp_sp = [[num_computed_tokens + num_new_tokens]]
+
+                # 分配 KV slots
+                while True:
+                    new_blocks = self.kv_cache_manager.allocate_slots(
+                        request,
+                        num_new_tokens,
+                        num_lookahead_tokens=self.num_lookahead_tokens)
+                    if new_blocks is None:
+                        # 无法继续调度，尝试抢占一个最低优先级请求
+                        preempted_req = self.running.pop()
+                        self.kv_cache_manager.free(preempted_req)
+                        preempted_req.status = RequestStatus.PREEMPTED
+                        preempted_req.num_computed_tokens = 0
+                        if self.log_stats:
+                            preempted_req.record_event(
+                                EngineCoreEventType.PREEMPTED,
+                                scheduled_timestamp)
+                        self.waiting.appendleft(preempted_req)
+                        preempted_reqs.append(preempted_req)
+                        if preempted_req == request:
+                            # 仍无法调度本请求
+                            num_new_tokens = 0
+                            break
+                    else:
+                        break
+
+                if num_new_tokens == 0:
+                    req_index += 1
+                    continue
+
+                # 记录调度结果
+                scheduled_running_reqs.append(request)
+                self.scheduled_req_ids.add(request.request_id)
+                if vllm_version_is("0.10.1.1"):
+                    req_to_new_block_ids[request.request_id] = (
+                        new_blocks.get_block_ids())
+                else:
+                    req_to_new_blocks[request.request_id] = new_blocks
+                num_scheduled_tokens[request.request_id] = num_new_tokens
+                token_budget -= num_new_tokens
+                req_index += 1
+
+        # If no prefill requests are scheduled, Schedule decode requests next.
         if len(self.scheduled_req_ids) == 0:
             req_index = 0
             while req_index < len(self.running) and token_budget > 0:
@@ -523,8 +651,8 @@ class AscendScheduler(Scheduler):
         return True
 
     def _get_prompt_limit(self, request: Request) -> int:
-        if (self.scheduler_config.chunked_prefill_enabled
-                and not self.scheduler_config.is_multi_step):
+        if (self.scheduler_config.chunked_prefill_enabled):
+                #and not self.scheduler_config.is_multi_step):
             prompt_limit = self.scheduler_config.max_model_len
         else:
             prompt_limit = min(
