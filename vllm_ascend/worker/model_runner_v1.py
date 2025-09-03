@@ -1070,6 +1070,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         for i in range(self.input_batch.num_reqs):
             block_table_req = block_table_cpu[i]
             block_table_indices = np.repeat(block_table_req, self.block_size)
+            logger.info(f"++++++++, i = {i}, cp = {self.cp_rank}, sp = {self.sp_rank} \n, num_computed_and_new_tokens_batch shape:{num_computed_and_new_tokens_batch.shape}")
             num_save_tokens_rank = num_computed_and_new_tokens_batch[i][self.cp_rank][self.sp_rank]
 
             positions_for_slot = self.arange_np[:num_save_tokens_rank]
@@ -1326,7 +1327,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             attn_mask_seqlens = torch.tensor([chunk_seqlens, chunk_seqlens], dtype=torch.int32)
             head_attn_nomask_seqlens = torch.tensor([chunk_seqlens, kv_with_q_head_nomask_seqlens], dtype=torch.int32)
             tail_attn_nomask_seqlens = torch.tensor([chunk_seqlens, kv_with_q_tail_nomask_seqlens], dtype=torch.int32)
-            cp_prefill_mask = torch.triu(torch.ones(512, 512, device=self.device, dtype=torch.bfloat16), 1)
+            cp_prefill_mask = torch.triu(torch.ones(512, 512, device=self.device, dtype=torch.float16), 1)
 
             self.extra_long_seq_kwargs = {
                 'attn_mask_seqlens': attn_mask_seqlens,

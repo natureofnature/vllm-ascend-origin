@@ -343,9 +343,11 @@ class AscendMLAMetadataBuilder:
         query_lens = query_seq_lens_cpu[:num_reqs]
         seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
         num_computed_tokens_cpu = (seq_lens - query_lens)
+        logger.info(f"num_computed_tokens_cpu:{num_computed_tokens_cpu}, seq_lens:{seq_lens}, query_lens:{query_lens}")
 
         prefill_metadata = None
         chunked_context_metadata = None
+        logger.info(f"********* here in build, num prefills:{num_prefills}")
         if num_prefills > 0:
             reqs_start = num_decodes  # prefill_start
             tokens_start = num_decode_tokens
@@ -357,6 +359,7 @@ class AscendMLAMetadataBuilder:
             context_lens_cpu = num_computed_tokens_cpu[reqs_start:num_reqs]
             max_context_len_cpu = context_lens_cpu.max().item()
             num_prefills_with_context_cpu = (context_lens_cpu > 0).sum().item()
+            logger.info(f"********* here in build, chunked prefill enabled:{self.chunked_prefill_enabled}, max_context_len_cpu:{max_context_len_cpu}")
             if self.chunked_prefill_enabled and max_context_len_cpu > 0:
                 max_context_chunk = (self.chunked_prefill_workspace_size //
                                      num_prefills_with_context_cpu)
@@ -387,6 +390,7 @@ class AscendMLAMetadataBuilder:
                     chunk_seq_lens=chunk_seq_lens,
                     workspace=self.chunked_prefill_workspace,
                 )
+                logger.info(f"********* here in build, chunked context metadata:{chunked_context_metadata}")
             prefill_input_positions = input_positions[tokens_start:]
             cos = self.cos_cache[
                 prefill_input_positions].unsqueeze(  # type: ignore
@@ -420,6 +424,8 @@ class AscendMLAMetadataBuilder:
                 q_full_idx=q_full_idx,
                 cp_prefill_mask=cp_prefill_mask
             )
+
+            #logger.info(f"******* here in build, prefill metadata:{prefill_metadata}")
 
         decode_metadata = None
         if num_decodes > 0:
@@ -625,6 +631,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             return prefix_output, prefix_lse
 
         iters = len(prefill_metadata.chunked_context.seq_tot)
+        logger.info(f"iters = {iters}")
         q_pe = query[..., self.qk_nope_head_dim:]
         q_nope = query[..., :self.qk_nope_head_dim]
 
@@ -676,6 +683,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
             if self.cp_size > 1:
                 # 先计算本 rank 对该 chunk 的贡献
+                #logger.info(f"===========> cp = {self.cp_size}, doing chunked prefill")
                 block_out_local = torch.empty(
                     num_tokens_all, self.num_heads, self.v_head_dim,
                     dtype=query.dtype, device=query.device)
@@ -746,6 +754,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 if chunk_out_g is not None:
                     prefix_output, prefix_lse = _update_out_and_lse(
                         prefix_output, prefix_lse, chunk_out_g, chunk_lse_g)
+                #logger.info(f"===========> cp = {self.cp_size}, finished chunked prefill")
             else:
                 torch_npu.atb.npu_ring_mla(
                     q_nope=q_nope,
@@ -791,6 +800,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
         # Here is only 2 possibility of input, ChunkedPrefill or PrefillNoCache
         ascend_config = get_ascend_config()
+        #logger.info("============> here in forward prefill")
 
         if attn_metadata.attn_state in [
                 AscendAttentionState.ChunkedPrefill,
@@ -802,6 +812,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                             dtype=query.dtype,
                                             device=query.device)
             # current requests is chunked in prefill, disable flash attention with chunked prefill
+            #logger.info("============> here meta attn")
             vanilla_chunked_prefill_mla(
                 output=attn_output_torch,
                 query=query,
@@ -823,6 +834,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 AscendAttentionState.SpecDecoding,
                 AscendAttentionState.PrefillCacheHit
         ]:
+            #logger.info("============> here chunked prefill, spec decodeding ")
             attn_lse = torch.empty(self.num_heads,
                                    num_tokens,
                                    dtype=torch.float32,
@@ -859,6 +871,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 query, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse)
 
         elif attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+            #logger.info("============> here, prefill no cache")
             key = torch.cat((k_nope, k_pe), dim=-1)
             torch_npu._npu_flash_attention(
                 query=query,
@@ -896,6 +909,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_metadata: AscendMLAMetadata,
         kv_c_and_k_pe_cache: Tuple[torch.Tensor],
     ) -> torch.Tensor:
+        #logger.info("============> here in prefill cp")
         num_tokens = query.size(0) # 单卡的token数
         # 构造存放attention的，分别存储requests以及单block的attention的值
         # attn_output_requests = []
@@ -957,6 +971,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         # 同步重排 LSE 以便后续进行上下文块累加
         attn_lse = torch.cat([head_lse, tail_lse], dim=1)
         attn_lse = attn_lse[:, q_full_idx]
+        logger.info(f"============> here before meta prefill, chunked prefill context:{attn_metadata.prefill.chunked_context}")
 
         # 后处理过程，先保持 [tokens, H, V] 形状，必要时执行 chunked 上下文累加
         if attn_metadata.prefill is not None and \
@@ -1286,6 +1301,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         output: Optional[torch.Tensor] = None,
         ckq: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        #logger.info("============> here to forward")
         assert output is not None, "Output tensor must be provided."
         if attn_metadata is None:
             # Profiling run.
@@ -1388,12 +1404,14 @@ class AscendMLAImpl(MLAAttentionImpl):
             # otherwise it may affect the accuracy
             # TODO: use an elegant way to overlap
             if self.cp_size > 1:
+                #logger.info("============> here before forward prefill cp")
                 output_prefill = self._forward_prefill_cp(prefill_q,
                                                           prefill_k_c_normed,
                                                           prefill_k_pe,
                                                           attn_metadata,
                                                           kv_cache)
             else:
+                #logger.info("============> here before forward prefill")
                 output_prefill = self._forward_prefill(prefill_q,
                                                        prefill_k_c_normed,
                                                        prefill_k_pe, kv_cache,

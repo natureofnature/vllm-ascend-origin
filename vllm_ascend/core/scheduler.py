@@ -68,7 +68,8 @@ class AscendScheduler(Scheduler):
         if self.scheduler_config.chunked_prefill_enabled:
             # 允许 CP + chunked prefill：调度仍沿用上游逻辑，
             # 真正的上下文分块累加在 attention 中处理。
-            return super().schedule()
+            #return super().schedule()
+            pass
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
@@ -524,8 +525,8 @@ class AscendScheduler(Scheduler):
         return True
 
     def _get_prompt_limit(self, request: Request) -> int:
-        if (self.scheduler_config.chunked_prefill_enabled
-                and not self.scheduler_config.is_multi_step):
+        if (self.scheduler_config.chunked_prefill_enabled):
+                #and not self.scheduler_config.is_multi_step):
             prompt_limit = self.scheduler_config.max_model_len
         else:
             prompt_limit = min(
