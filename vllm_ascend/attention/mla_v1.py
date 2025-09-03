@@ -971,6 +971,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         # 同步重排 LSE 以便后续进行上下文块累加
         attn_lse = torch.cat([head_lse, tail_lse], dim=1)
         attn_lse = attn_lse[:, q_full_idx]
+        logger.info(f"============> here before meta prefill, q_nope shape:{q_nope.shape}, q_pe shape:{q_pe.shape},k_nope shape:{k_nope.shape},k_pe shape:{k_pe.shape}")
         logger.info(f"============> here before meta prefill, out_head_shape:{output_head.shape}, out_tail_shape:{output_tail.shape}")
 
         # 后处理过程，先保持 [tokens, H, V] 形状，必要时执行 chunked 上下文累加
