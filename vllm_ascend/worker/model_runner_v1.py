@@ -1159,8 +1159,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
             if self.cp_size > 1 and num_tokens > 1:
                 # when cp > 1 & prefill, need to pad & split sequence here
+                # 在 chunked prefill 下，需要传入“当前步结束后的累计 tokens 数”，
+                # 否则只有 chunk 大小时会被当成总长度，导致本步长度为 0。
+                total_tokens_after_step = (
+                    self.input_batch.num_computed_tokens_cpu[i] + num_tokens
+                    if self.chunked_prefill_enabled else num_tokens
+                )
                 req_position_cp, num_cp_padded_scheduled_tokens, num_cp_pads[i] = self._num_scheduled_tokens_prefill_cp(
-                    num_tokens, self.input_batch.num_computed_tokens_cpu[i])
+                    total_tokens_after_step, self.input_batch.num_computed_tokens_cpu[i])
                 num_tokens = len(req_position_cp)
                 self.position_cp[start_index:start_index + num_tokens] = req_position_cp
                 start_index += num_tokens
