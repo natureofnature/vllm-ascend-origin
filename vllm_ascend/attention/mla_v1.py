@@ -972,7 +972,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_lse = torch.cat([head_lse, tail_lse], dim=1)
         attn_lse = attn_lse[:, q_full_idx]
         #logger.info(f"============> q_tail_idx:{q_tail_idx}\nq_full_idx:{q_full_idx}")
-        logger.info(f"============> here before meta prefill, q_nope shape:{q_nope.shape}, q_pe shape:{q_pe.shape},k_nope shape:{k_nope.shape},k_pe shape:{k_pe.shape}")
+        logger.info(f"============> here before meta prefill, q_nope shape:{q_nope.shape},q_nope_shape_select:{torch.index_select(q_nope, 0, q_head_idx).shape}, q_pe shape:{q_pe.shape},k_nope shape:{k_nope.shape},k_pe shape:{k_pe.shape}")
         logger.info(f"============> here before meta prefill, out_head_shape:{output_head.shape}, out_tail_shape:{output_tail.shape}")
 
         # 后处理过程，先保持 [tokens, H, V] 形状，必要时执行 chunked 上下文累加
