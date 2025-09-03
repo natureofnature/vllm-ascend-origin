@@ -1404,12 +1404,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             # otherwise it may affect the accuracy
             # TODO: use an elegant way to overlap
             if self.cp_size > 1:
-                #logger.info("============> here before forward prefill cp")
+                logger.info("============> here before forward prefill cp")
                 output_prefill = self._forward_prefill_cp(prefill_q,
                                                           prefill_k_c_normed,
                                                           prefill_k_pe,
                                                           attn_metadata,
                                                           kv_cache)
+                logger.info("============> here after forward prefill cp")
             else:
                 #logger.info("============> here before forward prefill")
                 output_prefill = self._forward_prefill(prefill_q,
