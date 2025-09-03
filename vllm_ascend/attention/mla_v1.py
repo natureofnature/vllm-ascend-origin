@@ -1045,6 +1045,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             output=attn_output,
             softmax_lse=attn_lse
         )
+        logger.info(f"+++ in attn with mask/nomask, q_nope shape:{q_nope.shape},q_rope_shape:{q_pe.shape}, attn_out_shape:{attn_output.shape}")
 
         # nomask
         if kv_nomask_idx.shape[0] == 0:
@@ -1073,6 +1074,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             output=attn_output,
             softmax_lse=attn_lse
         )
+        logger.info(f"+++ in attn with mask/nomask, q_nope shape:{q_nope.shape},q_rope_shape:{q_pe.shape}, attn_out_shape:{attn_output.shape}")
         return attn_output, attn_lse
 
     def _forward_decode(
