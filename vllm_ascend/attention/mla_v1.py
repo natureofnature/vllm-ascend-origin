@@ -390,7 +390,7 @@ class AscendMLAMetadataBuilder:
                     chunk_seq_lens=chunk_seq_lens,
                     workspace=self.chunked_prefill_workspace,
                 )
-                logger.info(f"********* here in build, chunked context metadata:{chunked_context_metadata}")
+                #logger.info(f"********* here in build, chunked context metadata:{chunked_context_metadata}")
             prefill_input_positions = input_positions[tokens_start:]
             cos = self.cos_cache[
                 prefill_input_positions].unsqueeze(  # type: ignore
@@ -1045,7 +1045,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             output=attn_output,
             softmax_lse=attn_lse
         )
-        logger.info(f"+++ in attn with mask/nomask, q_nope shape:{q_nope.shape},q_rope_shape:{q_pe.shape}, attn_out_shape:{attn_output.shape}")
+        #logger.info(f"+++ in attn with mask/nomask, q_nope shape:{q_nope.shape},q_rope_shape:{q_pe.shape}, attn_out_shape:{attn_output.shape}")
 
         # nomask
         if kv_nomask_idx.shape[0] == 0:
@@ -1408,13 +1408,13 @@ class AscendMLAImpl(MLAAttentionImpl):
             # otherwise it may affect the accuracy
             # TODO: use an elegant way to overlap
             if self.cp_size > 1:
-                logger.info("============> here before forward prefill cp")
+                #logger.info("============> here before forward prefill cp")
                 output_prefill = self._forward_prefill_cp(prefill_q,
                                                           prefill_k_c_normed,
                                                           prefill_k_pe,
                                                           attn_metadata,
                                                           kv_cache)
-                logger.info("============> here after forward prefill cp")
+                #logger.info("============> here after forward prefill cp")
             else:
                 #logger.info("============> here before forward prefill")
                 output_prefill = self._forward_prefill(prefill_q,
