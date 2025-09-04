@@ -33,6 +33,7 @@ from vllm_ascend.multistream.base import MSAttentionMetadataSplitConfig
 from vllm_ascend.multistream.context import get_multistream_comm_context
 from vllm_ascend.multistream.ms_split import model_input_split_v1_mla_attn
 from vllm_ascend.ops.attention import vanilla_chunked_prefill_mla
+from vllm_ascend.debug.kv_debug import dump_or_compare_kv
 from vllm_ascend.worker.npu_input_batch import InputBatch
 
 if TYPE_CHECKING:
@@ -104,6 +105,8 @@ class AscendMLAPrefillMetadata:
     tail_attn_nomask_seqlens: torch.Tensor = None
     q_full_idx: torch.Tensor = None
     cp_prefill_mask: torch.Tensor = None
+    # Optional: per-request token counts per (cp, sp) for CP-aware KV debug
+    num_computed_tokens_of_cp_sp: list[list[list[int]]] = None
 
 
 @dataclass
@@ -422,7 +425,8 @@ class AscendMLAMetadataBuilder:
                 head_attn_nomask_seqlens=head_attn_nomask_seqlens,
                 tail_attn_nomask_seqlens=tail_attn_nomask_seqlens,
                 q_full_idx=q_full_idx,
-                cp_prefill_mask=cp_prefill_mask
+                cp_prefill_mask=cp_prefill_mask,
+                num_computed_tokens_of_cp_sp=common_attn_metadata.common_long_seq_metadata.num_computed_tokens_of_cp_sp if common_attn_metadata.common_long_seq_metadata else None
             )
 
             #logger.info(f"******* here in build, prefill metadata:{prefill_metadata}")
@@ -1398,6 +1402,20 @@ class AscendMLAImpl(MLAAttentionImpl):
             key_cache=kv_cache[0],
             value_cache=kv_cache[1],
             slot_indices=attn_metadata.slot_mapping)
+        # KV debug: dump/compare after KV write
+        try:
+            dump_or_compare_kv(
+                attn_metadata=attn_metadata,
+                kv_cache=kv_cache,
+                cp_rank=self.cp_rank,
+                cp_size=self.cp_size,
+                sp_rank=self.sp_rank,
+                sp_size=self.sp_size,
+                device=hidden_states_or_q_c.device,
+                tag="prefill" if has_prefill else "decode",
+            )
+        except Exception as _dbg_exc:
+            logger.warning(f"[KVDBG] hook failed: {_dbg_exc}")
         o_proj_input_shape = (num_actual_toks,
                               self.num_heads * self.v_head_dim)
         o_proj_input = torch.empty(o_proj_input_shape,
