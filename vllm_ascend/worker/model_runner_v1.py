@@ -1070,7 +1070,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         for i in range(self.input_batch.num_reqs):
             block_table_req = block_table_cpu[i]
             block_table_indices = np.repeat(block_table_req, self.block_size)
-            logger.info(f"++++++++, i = {i}, cp = {self.cp_rank}, sp = {self.sp_rank} \n, num_computed_and_new_tokens_batch shape:{num_computed_and_new_tokens_batch.shape}")
             num_save_tokens_rank = num_computed_and_new_tokens_batch[i][self.cp_rank][self.sp_rank]
 
             positions_for_slot = self.arange_np[:num_save_tokens_rank]
@@ -1081,6 +1080,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             kv_save_start = np.sum(num_computed_and_new_tokens_batch[i][:self.cp_rank]) + np.sum(
                 num_computed_and_new_tokens_batch[i][self.cp_rank][:self.sp_rank])
 
+            logger.info(f"++++++++, i = {i}, cp = {self.cp_rank}, sp = {self.sp_rank}\n" 
+                        f"num_computed_and_new_tokens_batch shape:{num_computed_and_new_tokens_batch.shape}\n"
+                        f"start_index:{start_index}, kv_save_start:{kv_save_start}, num_save_token_rank:{num_save_tokens_rank}\n"
+                        f"shape_left:{self.slot_mapping_np[start_index + kv_save_start:start_index + kv_save_start + num_save_tokens_rank].shape},"
+                        f"shape_right:{slot_mapping.shape}"
+                        )
             self.slot_mapping_np[
             start_index + kv_save_start:start_index + kv_save_start + num_save_tokens_rank] = slot_mapping
 
@@ -1232,6 +1237,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if self.cp_size * self.sp_size > 1:
             if is_prefill:
                 self.slot_mapping_np.fill(-1)
+                logger.info(f"$$$$$ slot mapping {num_scheduled_tokens_for_slot}")
                 self._slot_mapping_prefill_cp(num_scheduled_tokens_for_slot)
             else:
                 self.slot_mapping_np.fill(-1)
