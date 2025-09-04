@@ -1223,6 +1223,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
 
+        logger.info(f"self.input_batch.num_computed_tokens_cpu[:num_reqs]:{self.input_batch.num_computed_tokens_cpu[:num_reqs]}, num_scheduled_tokens:{num_scheduled_tokens}")
         self.seq_lens_np[:num_reqs] = (
                 self.input_batch.num_computed_tokens_cpu[:num_reqs] +
                 num_scheduled_tokens)
