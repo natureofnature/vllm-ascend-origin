@@ -1277,9 +1277,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             kv_req_offset = 0
             q_head_chunk_id = self.cp_rank
             q_tail_chunk_id = self.cp_size * 2 - 1 - self.cp_rank
+            logger.info(f">>>>> seq_lens:{seq_lens} of self.cpu_len:{self.seq_lens_cpu}")
             for seq_len in seq_lens:
                 chunk_len = seq_len // 2
                 chunk_seqlens.append(chunk_len)
+                logger.info(f">>>>> q_req_offset:{q_req_offset}, chunk len:{chunk_len}")
                 q_head_idx.extend(list(range(q_req_offset, q_req_offset + chunk_len)))
                 kv_with_q_head_nomask_idx.extend(
                     list(range(kv_req_offset, kv_req_offset + chunk_len * q_head_chunk_id)))
