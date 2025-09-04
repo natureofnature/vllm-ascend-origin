@@ -1119,6 +1119,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     Optional[torch.Tensor]]:
         # Check input valid
         total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        logger.info(f"*************** scheduler total scheduled tokens:{total_num_scheduled_tokens}")
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
@@ -1157,6 +1158,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.cp_kv_recover_idx[rank] = []  # 保证各个rank的list独立
         for i, req_id in enumerate(self.input_batch.req_ids):
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            logger.info(f"num_tokens for request {i}: {num_tokens}")
             if self.cp_size > 1 and num_tokens > 1:
                 # when cp > 1 & prefill, need to pad & split sequence here
                 # 在 chunked prefill 下，需要传入“当前步结束后的累计 tokens 数”，
