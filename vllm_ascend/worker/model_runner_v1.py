@@ -1070,15 +1070,18 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         for i in range(self.input_batch.num_reqs):
             block_table_req = block_table_cpu[i]
             block_table_indices = np.repeat(block_table_req, self.block_size)
-            num_save_tokens_rank = num_computed_and_new_tokens_batch[i][self.cp_rank][self.sp_rank]
+            # Only save the new tokens for this step per (cp, sp) rank.
+            # Distribute current-step CP-padded tokens evenly across cp*sp ranks.
+            per_rank_new_tokens = int(num_scheduled_tokens_for_slot[i] // (self.cp_size * self.sp_size))
+            num_save_tokens_rank = per_rank_new_tokens
 
             positions_for_slot = self.arange_np[:num_save_tokens_rank]
             block_offsets = positions_for_slot % self.block_size
             slot_mapping = (block_table_indices * self.block_size)[:num_save_tokens_rank] + block_offsets
 
             num_cp_padded_scheduled_tokens = num_scheduled_tokens_for_slot[i]
-            kv_save_start = np.sum(num_computed_and_new_tokens_batch[i][:self.cp_rank]) + np.sum(
-                num_computed_and_new_tokens_batch[i][self.cp_rank][:self.sp_rank])
+            # Offset within this step's contiguous buffer across cp*sp ranks.
+            kv_save_start = per_rank_new_tokens * (self.cp_rank * self.sp_size + self.sp_rank)
 
             logger.info(f"++++++++, i = {i}, cp = {self.cp_rank}, sp = {self.sp_rank}\n" 
                         f"num_computed_and_new_tokens_batch shape:{num_computed_and_new_tokens_batch.shape}\n"
@@ -1229,8 +1232,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
 
         logger.info(f"self.input_batch.num_computed_tokens_cpu[:num_reqs]:{self.input_batch.num_computed_tokens_cpu[:num_reqs]}, num_scheduled_tokens:{num_scheduled_tokens}")
-        self.seq_lens_np[:num_reqs] = (
-                #self.input_batch.num_computed_tokens_cpu[:num_reqs] + # removed by wzl
+        # For CP prefill, downstream MLA uses per-step query lengths to split Q,
+        # so set seq_lens to current-step scheduled lengths to avoid inflating to
+        # (computed + query). Keep original cumulative behavior for other cases.
+        if self.cp_size > 1 and is_prefill:
+            self.seq_lens_np[:num_reqs] = num_scheduled_tokens
+        else:
+            self.seq_lens_np[:num_reqs] = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] +
                 num_scheduled_tokens)
         seq_lens = self.seq_lens_cpu[:num_reqs]
 
