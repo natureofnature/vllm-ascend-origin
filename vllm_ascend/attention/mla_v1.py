@@ -1413,6 +1413,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 sp_size=self.sp_size,
                 device=hidden_states_or_q_c.device,
                 tag="prefill" if has_prefill else "decode",
+                layer_idx=getattr(layer, 'layer_idx', -1),
             )
         except Exception as _dbg_exc:
             logger.warning(f"[KVDBG] hook failed: {_dbg_exc}")

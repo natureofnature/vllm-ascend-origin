@@ -77,6 +77,7 @@ def dump_or_compare_kv(
     sp_size: int,
     device: torch.device,
     tag: str,
+    layer_idx: int = -1,
 ) -> None:
     if not _is_enabled():
         return
@@ -147,6 +148,7 @@ def dump_or_compare_kv(
         "sp_rank": sp_rank,
         "sp_size": sp_size,
         "tag": tag,
+        "layer_idx": int(layer_idx),
     }
 
     tensor_dump = {
@@ -158,7 +160,7 @@ def dump_or_compare_kv(
         manifest = os.path.join(run_dir, f"manifest_{key_hash}_gt.json")
         with open(manifest, "w") as f:
             json.dump(meta, f)
-        out_path = os.path.join(run_dir, f"kv_rank{cp_rank}-{sp_rank}_{key_hash}.pkl")
+        out_path = os.path.join(run_dir, f"kv_L{layer_idx}_rank{cp_rank}-{sp_rank}_{key_hash}.pkl")
         _save_pickle(out_path, tensor_dump)
         logger.info(f"[KVDBG] saved GT kv to {out_path}")
         return
@@ -172,7 +174,10 @@ def dump_or_compare_kv(
         with open(manifest_gt, "r") as f:
             meta_gt = json.load(f)
         gt_dir = os.path.dirname(manifest_gt)
-        gt_path = os.path.join(gt_dir, f"kv_rank{cp_rank}-{sp_rank}_{key_hash}.pkl")
+        # Prefer layer-specific file; fallback to legacy naming if absent
+        gt_path_layer = os.path.join(gt_dir, f"kv_L{layer_idx}_rank{cp_rank}-{sp_rank}_{key_hash}.pkl")
+        gt_path_legacy = os.path.join(gt_dir, f"kv_rank{cp_rank}-{sp_rank}_{key_hash}.pkl")
+        gt_path = gt_path_layer if os.path.exists(gt_path_layer) else gt_path_legacy
         if not os.path.exists(gt_path):
             logger.warning(f"[KVDBG] GT file not found for rank {cp_rank}-{sp_rank}: {gt_path}")
             return
