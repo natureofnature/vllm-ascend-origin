@@ -1422,6 +1422,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 tag="prefill" if has_prefill else "decode",
                 layer_idx=(getattr(layer, 'layer_idx', None) if layer is not None else None)
                            if getattr(layer, 'layer_idx', None) is not None else self._debug_layer_idx,
+                tp_rank=self.sp_rank,
+                tp_size=self.sp_size,
             )
         except Exception as _dbg_exc:
             logger.warning(f"[KVDBG] hook failed: {_dbg_exc}")

@@ -78,6 +78,38 @@ def _save_pickle(path: str, obj) -> None:
         pickle.dump(obj, f)
 
 
+def _load_manifest_json(path: str) -> dict:
+    if not os.path.exists(path):
+        return {"version": 1, "entries": []}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"version": 1, "entries": []}
+
+
+def _save_manifest_json(path: str, data: dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    os.replace(tmp, path)
+
+
+def _upsert_manifest_entry(manifest: dict, entry: dict) -> dict:
+    entries = manifest.get("entries", [])
+    key_fields = ["layer_idx", "cp_rank", "cp_size", "sp_rank", "sp_size", "tag"]
+    def same_key(a, b):
+        return all(a.get(k) == b.get(k) for k in key_fields)
+    for i, e in enumerate(entries):
+        if same_key(e, entry):
+            entries[i] = entry
+            break
+    else:
+        entries.append(entry)
+    manifest["entries"] = entries
+    return manifest
+
+
 def _get_tol() -> tuple[float, float, bool]:
     strict = os.getenv("VLLM_ASCEND_KV_DEBUG_STRICT", "0") in ("1", "true", "True")
     try:
@@ -124,6 +156,8 @@ def dump_or_compare_kv(
     device: torch.device,
     tag: str,
     layer_idx: int = -1,
+    tp_rank: int | None = None,
+    tp_size: int | None = None,
 ) -> None:
     if not _is_enabled():
         return
@@ -182,15 +216,20 @@ def dump_or_compare_kv(
     _ensure_dir(base_dir)
     gt_dir, manifest_gt = _gt_paths(base_dir)
 
+    # Effective TP: if not provided, fallback to SP (some codebases alias SP to TP)
+    eff_tp_rank = sp_rank if tp_rank is None else int(tp_rank)
+    eff_tp_size = sp_size if tp_size is None else int(tp_size)
+
     meta = {
         "mode": "gt" if _ground_truth_mode() else "chk",
-        "key": _hash_list_int(seq_len_list),
         "num_reqs": len(seq_len_list),
         "seq_len": seq_len_list,
         "cp_rank": cp_rank,
         "cp_size": cp_size,
         "sp_rank": sp_rank,
         "sp_size": sp_size,
+        "tp_rank": eff_tp_rank,
+        "tp_size": eff_tp_size,
         "tag": tag,
         "layer_idx": int(layer_idx),
     }
@@ -201,16 +240,26 @@ def dump_or_compare_kv(
     }
 
     if _ground_truth_mode():
-        # Write single shared GT set (overwritable by env)
+        # Write/merge manifest entry for this (layer, cp, sp, tag)
         overwrite = os.getenv("VLLM_ASCEND_KV_DEBUG_OVERWRITE_GT", "0") in ("1", "true", "True")
-        mode = "w" if overwrite or (not os.path.exists(manifest_gt)) else None
-        if mode is None:
-            logger.info("[KVDBG] GT exists; skip (set VLLM_ASCEND_KV_DEBUG_OVERWRITE_GT=1 to overwrite)")
-            return
-        with open(manifest_gt, mode) as f:
-            json.dump(meta, f)
+        manifest_data = {} if overwrite else _load_manifest_json(manifest_gt)
+        entry = {
+            "layer_idx": int(layer_idx),
+            "cp_rank": int(cp_rank),
+            "cp_size": int(cp_size),
+            "sp_rank": int(sp_rank),
+            "sp_size": int(sp_size),
+            "tp_rank": eff_tp_rank,
+            "tp_size": eff_tp_size,
+            "tag": str(tag),
+            "num_reqs": int(meta["num_reqs"]),
+            "seq_len": seq_len_list,
+            "kv_path": f"L{layer_idx}/tp{eff_tp_rank}/cp{cp_rank}-sp{sp_rank}/kv.pkl",
+        }
+        manifest_data = _upsert_manifest_entry(manifest_data, entry)
+        _save_manifest_json(manifest_gt, manifest_data)
         # Per-layer, per-(cp,sp) subdir
-        out_dir = os.path.join(gt_dir, f"L{layer_idx}", f"cp{cp_rank}-sp{sp_rank}")
+        out_dir = os.path.join(gt_dir, f"L{layer_idx}", f"tp{eff_tp_rank}", f"cp{cp_rank}-sp{sp_rank}")
         _ensure_dir(out_dir)
         out_path = os.path.join(out_dir, "kv.pkl")
         _save_pickle(out_path, tensor_dump)
@@ -223,20 +272,29 @@ def dump_or_compare_kv(
         logger.warning("[KVDBG] no GT manifest found; run with chunked prefill disabled first")
         return
     try:
-        with open(manifest_path, "r") as f:
-            meta_gt = json.load(f)
-        # Prefer new structured path
-        gt_path = os.path.join(gt_dir, f"L{layer_idx}", f"cp{cp_rank}-sp{sp_rank}", "kv.pkl")
+        manifest_data = _load_manifest_json(manifest_path)
+        # Select matching entry
+        entries = manifest_data.get("entries", [])
+        match = None
+        for e in entries:
+            if (e.get("layer_idx") == int(layer_idx) and
+                e.get("cp_rank") == int(cp_rank) and
+                e.get("cp_size") == int(cp_size) and
+                e.get("sp_rank") == int(sp_rank) and
+                e.get("sp_size") == int(sp_size) and
+                e.get("tp_rank", eff_tp_rank) == eff_tp_rank and
+                e.get("tp_size", eff_tp_size) == eff_tp_size and
+                e.get("tag") == str(tag)):
+                match = e
+                break
+        if match is None:
+            logger.warning(f"[KVDBG] GT entry not found for L{layer_idx} cp{cp_rank}/{cp_size} sp{sp_rank}/{sp_size} tag={tag}")
+            return
+        gt_seq = match.get("seq_len", [])
+        kv_rel_path = match.get("kv_path")
+        gt_path = os.path.join(gt_dir, kv_rel_path) if kv_rel_path else os.path.join(gt_dir, f"L{layer_idx}", f"tp{eff_tp_rank}", f"cp{cp_rank}-sp{sp_rank}", "kv.pkl")
         if not os.path.exists(gt_path):
-            # fallback legacy layer file
-            legacy_layer = os.path.join(gt_dir, f"kv_L{layer_idx}_rank{cp_rank}-{sp_rank}.pkl")
-            gt_path = legacy_layer if os.path.exists(legacy_layer) else gt_path
-        if not os.path.exists(gt_path):
-            # fallback legacy rank file without layer
-            legacy_rank = os.path.join(gt_dir, f"kv_rank{cp_rank}-{sp_rank}.pkl")
-            gt_path = legacy_rank if os.path.exists(legacy_rank) else gt_path
-        if not os.path.exists(gt_path):
-            logger.warning(f"[KVDBG] GT file not found for rank {cp_rank}-{sp_rank} L{layer_idx}")
+            logger.warning(f"[KVDBG] GT file missing at {gt_path}")
             return
         gt = _load_pickle(gt_path)
     except Exception as exc:
@@ -245,7 +303,6 @@ def dump_or_compare_kv(
 
     # Build expected prefix by slicing GT per-request
     try:
-        gt_seq = meta_gt.get("seq_len", [])
         if len(gt_seq) != len(seq_len_list):
             logger.warning(f"[KVDBG] GT seq_len size mismatch: gt={len(gt_seq)} cur={len(seq_len_list)}")
             return
