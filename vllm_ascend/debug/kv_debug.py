@@ -148,7 +148,7 @@ def dump_or_compare_kv(
 
     meta = {
         "mode": "gt" if _ground_truth_mode() else "chk",
-        "key": key_hash,
+        "key": _hash_list_int(seq_len_list),
         "num_reqs": len(seq_len_list),
         "seq_len": seq_len_list,
         "cp_rank": cp_rank,
