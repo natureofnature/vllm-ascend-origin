@@ -288,7 +288,15 @@ def dump_or_compare_kv(
                 match = e
                 break
         if match is None:
-            logger.warning(f"[KVDBG] GT entry not found for L{layer_idx} cp{cp_rank}/{cp_size} sp{sp_rank}/{sp_size} tag={tag}")
+            # Print brief manifest summary to help align GT/compare settings
+            avail = []
+            for e in entries:
+                if e.get("layer_idx") == int(layer_idx) and e.get("tag") == str(tag):
+                    avail.append(f"cp{e.get('cp_rank')}/{e.get('cp_size')} sp{e.get('sp_rank')}/{e.get('sp_size')} tp{e.get('tp_rank', 'NA')}/{e.get('tp_size', 'NA')}")
+            logger.warning(
+                f"[KVDBG] GT entry not found for L{layer_idx} cp{cp_rank}/{cp_size} sp{sp_rank}/{sp_size} tp{eff_tp_rank}/{eff_tp_size} tag={tag}. "
+                f"Available for this layer/tag: {', '.join(avail) if avail else 'none'}. "
+                f"Ensure GT run used the same cp/sp/tp sizes and all ranks had VLLM_ASCEND_KV_DEBUG=1.")
             return
         gt_seq = match.get("seq_len", [])
         kv_rel_path = match.get("kv_path")
