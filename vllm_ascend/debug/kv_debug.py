@@ -78,6 +78,42 @@ def _save_pickle(path: str, obj) -> None:
         pickle.dump(obj, f)
 
 
+def _get_tol() -> tuple[float, float, bool]:
+    strict = os.getenv("VLLM_ASCEND_KV_DEBUG_STRICT", "0") in ("1", "true", "True")
+    try:
+        rtol = float(os.getenv("VLLM_ASCEND_KV_DEBUG_RTOL", "1e-3"))
+    except Exception:
+        rtol = 1e-3
+    try:
+        atol = float(os.getenv("VLLM_ASCEND_KV_DEBUG_ATOL", "1e-3"))
+    except Exception:
+        atol = 1e-3
+    return rtol, atol, strict
+
+
+def _first_mismatch_index(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    rtol: float,
+    atol: float,
+    strict: bool,
+):
+    # a, b: [tokens, ...]
+    if a.shape != b.shape or a.numel() == 0:
+        return 0
+    a2 = a.view(a.shape[0], -1).to(torch.float32)
+    b2 = b.view(b.shape[0], -1).to(torch.float32)
+    if strict:
+        diff_mask = (a2 != b2).any(dim=1)
+    else:
+        isclose_elem = torch.isclose(a2, b2, rtol=rtol, atol=atol)
+        diff_mask = (~isclose_elem).any(dim=1)
+    idx = torch.nonzero(diff_mask, as_tuple=False)
+    if idx.numel() == 0:
+        return None
+    return int(idx[0].item())
+
+
 def dump_or_compare_kv(
     attn_metadata,
     kv_cache: Tuple[torch.Tensor, torch.Tensor],
@@ -173,7 +209,10 @@ def dump_or_compare_kv(
             return
         with open(manifest_gt, mode) as f:
             json.dump(meta, f)
-        out_path = os.path.join(gt_dir, f"kv_L{layer_idx}_rank{cp_rank}-{sp_rank}.pkl")
+        # Per-layer, per-(cp,sp) subdir
+        out_dir = os.path.join(gt_dir, f"L{layer_idx}", f"cp{cp_rank}-sp{sp_rank}")
+        _ensure_dir(out_dir)
+        out_path = os.path.join(out_dir, "kv.pkl")
         _save_pickle(out_path, tensor_dump)
         logger.info(f"[KVDBG] saved GT kv to {out_path}")
         return
@@ -186,12 +225,18 @@ def dump_or_compare_kv(
     try:
         with open(manifest_path, "r") as f:
             meta_gt = json.load(f)
-        gt_path = os.path.join(gt_dir, f"kv_L{layer_idx}_rank{cp_rank}-{sp_rank}.pkl")
+        # Prefer new structured path
+        gt_path = os.path.join(gt_dir, f"L{layer_idx}", f"cp{cp_rank}-sp{sp_rank}", "kv.pkl")
         if not os.path.exists(gt_path):
-            # fallback legacy name
-            gt_path = os.path.join(gt_dir, f"kv_rank{cp_rank}-{sp_rank}.pkl")
+            # fallback legacy layer file
+            legacy_layer = os.path.join(gt_dir, f"kv_L{layer_idx}_rank{cp_rank}-{sp_rank}.pkl")
+            gt_path = legacy_layer if os.path.exists(legacy_layer) else gt_path
         if not os.path.exists(gt_path):
-            logger.warning(f"[KVDBG] GT file not found for rank {cp_rank}-{sp_rank}")
+            # fallback legacy rank file without layer
+            legacy_rank = os.path.join(gt_dir, f"kv_rank{cp_rank}-{sp_rank}.pkl")
+            gt_path = legacy_rank if os.path.exists(legacy_rank) else gt_path
+        if not os.path.exists(gt_path):
+            logger.warning(f"[KVDBG] GT file not found for rank {cp_rank}-{sp_rank} L{layer_idx}")
             return
         gt = _load_pickle(gt_path)
     except Exception as exc:
@@ -227,11 +272,15 @@ def dump_or_compare_kv(
         logger.warning(f"[KVDBG] build expected prefix failed: {exc}")
         return
 
+    rtol, atol, strict = _get_tol()
+
     def _tensor_close(a: torch.Tensor, b: torch.Tensor) -> bool:
         if a.shape != b.shape:
             return False
         try:
-            return torch.allclose(a, b, rtol=1e-3, atol=1e-3)
+            if strict:
+                return torch.equal(a, b)
+            return torch.allclose(a, b, rtol=rtol, atol=atol)
         except Exception:
             return False
 
@@ -243,15 +292,42 @@ def dump_or_compare_kv(
     else:
         # Save diff snapshot for inspection
         run_dir = _cmp_dir(base_dir)
-        out_path = os.path.join(run_dir, f"kv_cmp_L{layer_idx}_rank{cp_rank}-{sp_rank}.pkl")
+        out_dir = os.path.join(run_dir, f"L{layer_idx}", f"cp{cp_rank}-sp{sp_rank}")
+        _ensure_dir(out_dir)
+        out_path = os.path.join(out_dir, "kv_cmp.pkl")
+        # Find first mismatch token indices
+        kv_first_bad = _first_mismatch_index(tensor_dump["kv_c_normed"], kv_gt_expect, rtol, atol, strict)
+        pe_first_bad = _first_mismatch_index(tensor_dump["k_pe"], kpe_gt_expect, rtol, atol, strict)
+        # Map token index to (req_id, offset)
+        def _tok_to_req_off(token_idx: int, lens: list[int]):
+            if token_idx is None:
+                return None
+            cum = 0
+            for rid, L in enumerate(lens):
+                if token_idx < cum + L:
+                    return {"req": rid, "offset": token_idx - cum}
+                cum += L
+            return {"req": -1, "offset": -1}
+        kv_loc = _tok_to_req_off(kv_first_bad, seq_len_list)
+        pe_loc = _tok_to_req_off(pe_first_bad, seq_len_list)
         _save_pickle(out_path, {
             "cur": tensor_dump,
             "expect": {"kv_c_normed": kv_gt_expect, "k_pe": kpe_gt_expect},
             "gt_full": gt,
             "meta": meta,
             "meta_gt": meta_gt,
+            "kv_first_bad_token": kv_first_bad,
+            "pe_first_bad_token": pe_first_bad,
+            "kv_first_bad_loc": kv_loc,
+            "pe_first_bad_loc": pe_loc,
         })
+        detail = []
+        if kv_first_bad is not None:
+            detail.append(f"kv@tok{kv_first_bad}:{kv_loc}")
+        if pe_first_bad is not None:
+            detail.append(f"pe@tok{pe_first_bad}:{pe_loc}")
         logger.warning(
-            f"[KVDBG] MISMATCH rank({cp_rank},{sp_rank}) L{layer_idx} tokens={total_tokens} -> {out_path}")
+            f"[KVDBG] MISMATCH rank({cp_rank},{sp_rank}) L{layer_idx} tokens={total_tokens} -> {out_path} | "
+            + ", ".join(detail))
 
 

@@ -489,6 +489,9 @@ class AscendMLAImpl(MLAAttentionImpl):
     understand this class
     """
 
+    # Auto-increment layer index per attention impl instance
+    _layer_instance_counter: int = 0
+
     def __init__(
         self,
         num_heads: int,
@@ -542,6 +545,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.sp_size = get_tensor_model_parallel_world_size() if self.enable_sp else 1
         self.sp_rank = get_tensor_model_parallel_rank() if self.enable_sp else 0
         self.sp_group = get_tp_group().device_group
+
+        # Assign a stable debug layer index per attention impl instance
+        type(self)._layer_instance_counter += 1
+        self._debug_layer_idx = int(type(self)._layer_instance_counter - 1)
 
     def _v_up_proj_and_o_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
@@ -1413,7 +1420,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 sp_size=self.sp_size,
                 device=hidden_states_or_q_c.device,
                 tag="prefill" if has_prefill else "decode",
-                layer_idx=getattr(layer, 'layer_idx', -1),
+                layer_idx=(getattr(layer, 'layer_idx', None) if layer is not None else None)
+                           if getattr(layer, 'layer_idx', None) is not None else self._debug_layer_idx,
             )
         except Exception as _dbg_exc:
             logger.warning(f"[KVDBG] hook failed: {_dbg_exc}")
