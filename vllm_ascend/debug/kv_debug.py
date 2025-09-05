@@ -9,7 +9,6 @@ from typing import Optional, Tuple
 import torch
 import torch_npu  # type: ignore
 from vllm.logger import logger  # type: ignore
-from vllm.config import get_current_vllm_config  # type: ignore
 
 
 def _ensure_dir(path: str) -> None:
@@ -37,12 +36,12 @@ def _is_enabled() -> bool:
 
 
 def _chunked_prefill_enabled() -> bool:
-    try:
-        cfg = get_current_vllm_config()
-        return bool(cfg.scheduler_config.chunked_prefill_enabled)
-    except Exception:
-        # Fallback to env if config is not accessible
-        return os.getenv("VLLM_ASCEND_FORCE_CHUNKED", "0") in ("1", "true", "True")
+    # Prefer explicit env from user; support multiple names for convenience
+    for name in ("VLLM_ASCEND_CHUNKED_PREFILL", "VLLM_ASCEND_IS_CHUNKED", "VLLM_ASCEND_FORCE_CHUNKED"):
+        val = os.getenv(name)
+        if val is not None:
+            return val in ("1", "true", "True")
+    return False
 
 
 def _ground_truth_mode() -> bool:
