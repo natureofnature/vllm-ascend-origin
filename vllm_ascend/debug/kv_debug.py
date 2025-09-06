@@ -243,8 +243,6 @@ def dump_or_compare_kv(
         return
 
     total_tokens = sum(seq_len_list)
-    if total_tokens <= 0:
-        return
 
     block_table = attn_metadata.block_tables  # [bs, max_blocks_per_req]
     cache_kv_c, cache_k_pe = kv_cache[0], kv_cache[1]
@@ -317,7 +315,14 @@ def dump_or_compare_kv(
         out_dir = os.path.join(gt_dir, f"L{layer_idx}", f"tp{eff_tp_rank}", f"cp{cp_rank}-sp{sp_rank}")
         _ensure_dir(out_dir)
         out_path = os.path.join(out_dir, "kv.pkl")
-        _save_pickle(out_path, tensor_dump)
+        # If this rank has 0 tokens this step, still write an empty tensor to mark presence
+        if total_tokens <= 0:
+            _save_pickle(out_path, {
+                "kv_c_normed": torch.empty((0,), dtype=torch.float16),
+                "k_pe": torch.empty((0,), dtype=torch.float16),
+            })
+        else:
+            _save_pickle(out_path, tensor_dump)
         logger.info(f"[KVDBG] saved GT kv to {out_path}")
         return
 
@@ -330,19 +335,17 @@ def dump_or_compare_kv(
         manifest_data = _load_manifest_json(manifest_path)
         # Select matching entry
         entries = manifest_data.get("entries", [])
-        match = None
-        for e in entries:
+        candidates = [
+            e for e in entries
             if (e.get("layer_idx") == int(layer_idx) and
                 e.get("cp_rank") == int(cp_rank) and
                 e.get("cp_size") == int(cp_size) and
                 e.get("sp_rank") == int(sp_rank) and
                 e.get("sp_size") == int(sp_size) and
                 e.get("tp_rank", eff_tp_rank) == eff_tp_rank and
-                e.get("tp_size", eff_tp_size) == eff_tp_size and
-                e.get("tag") == str(tag)):
-                match = e
-                break
-        if match is None:
+                e.get("tp_size", eff_tp_size) == eff_tp_size)
+        ]
+        if not candidates:
             # Print brief manifest summary to help align GT/compare settings
             avail = []
             for e in entries:
@@ -353,6 +356,10 @@ def dump_or_compare_kv(
                 f"Available for this layer/tag: {', '.join(avail) if avail else 'none'}. "
                 f"Ensure GT run used the same cp/sp/tp sizes and all ranks had VLLM_ASCEND_KV_DEBUG=1.")
             return
+        # Prefer tag match, otherwise take the one with largest total seq tokens
+        tagged = [e for e in candidates if e.get("tag") == str(tag)]
+        chosen = tagged if tagged else candidates
+        match = max(chosen, key=lambda e: sum(e.get("seq_len", [])))
         gt_seq = match.get("seq_len", [])
         kv_rel_path = match.get("kv_path")
         gt_path = os.path.join(gt_dir, kv_rel_path) if kv_rel_path else os.path.join(gt_dir, f"L{layer_idx}", f"tp{eff_tp_rank}", f"cp{cp_rank}-sp{sp_rank}", "kv.pkl")
