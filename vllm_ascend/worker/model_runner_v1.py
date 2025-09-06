@@ -1071,9 +1071,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             block_table_req = block_table_cpu[i]
             block_table_indices = np.repeat(block_table_req, self.block_size)
             # Only save the new tokens for this step per (cp, sp) rank.
-            # Distribute current-step CP-padded tokens evenly across cp*sp ranks.
+            # Equal-stride region for this rank in the cp-padded buffer.
             per_rank_new_tokens = int(num_scheduled_tokens_for_slot[i] // (self.cp_size * self.sp_size))
-            num_save_tokens_rank = per_rank_new_tokens
+            # Use scheduler-provided per-rank actual new tokens (before cp padding).
+            base_computed = int(self.input_batch.num_computed_tokens_cpu[i])
+            actual_new_tokens_rank = int(num_computed_and_new_tokens_batch[i][self.cp_rank][self.sp_rank]) - base_computed
+            if actual_new_tokens_rank < 0:
+                actual_new_tokens_rank = 0
+            # Only map actual new tokens; leave padding entries as -1.
+            num_save_tokens_rank = min(per_rank_new_tokens, actual_new_tokens_rank)
 
             positions_for_slot = self.arange_np[:num_save_tokens_rank]
             block_offsets = positions_for_slot % self.block_size
