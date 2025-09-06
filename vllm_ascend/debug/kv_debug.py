@@ -83,6 +83,18 @@ def _is_enabled() -> bool:
     return flag in ("1", "true", "True")
 
 
+def _force_all_ranks() -> bool:
+    # Allow forcing GT collection on all ranks even if some ranks missed env/ctrl
+    ctrl = _load_ctrl()
+    if isinstance(ctrl, dict) and ctrl.get("force_all_ranks"):
+        return True
+    try:
+        flag_path = os.path.join(_get_debug_base_dir(), "groundtruth", ".collect_all_ranks")
+        return os.path.exists(flag_path)
+    except Exception:
+        return False
+
+
 def _chunked_prefill_enabled() -> bool:
     # Prefer control file, then env
     ctrl = _load_ctrl()
@@ -214,7 +226,8 @@ def dump_or_compare_kv(
     tp_rank: int | None = None,
     tp_size: int | None = None,
 ) -> None:
-    if not _is_enabled():
+    # In GT mode, allow forcing collection on all ranks via ctrl/file flag
+    if not (_is_enabled() or (_ground_truth_mode() and _force_all_ranks())):
         return
 
     try:
