@@ -3,6 +3,16 @@
 对比:VLLM_ASCEND_KV_DEBUG=1 且 VLLM_ASCEND_CHUNKED_PREFILL=1
 覆盖已有:VLLM_ASCEND_KV_DEBUG_OVERWRITE_GT=1
 输出根目录:VLLM_ASCEND_KV_DEBUG_DIR（默认 ./kv_debug）
+写入文件:VLLM_ASCEND_KV_DEBUG_CTRL（默认 ./kv_debug/ctrl.json）
+{
+  "enabled": true,
+  "chunked": false,
+  "base_dir": "./kv_debug",
+  "strict": false,
+  "rtol": 1e-3,
+  "atol": 1e-3
+}
+
 """
 import os
 import json
@@ -32,16 +42,55 @@ def _hash_list_int(int_list: list[int]) -> str:
     return h.hexdigest()[:12]
 
 
+_CTRL_CACHE = {"path": None, "mtime": 0.0, "data": None}
+
+
+def _ctrl_path_default() -> str:
+    # Default control file under base dir
+    return os.getenv("VLLM_ASCEND_KV_DEBUG_CTRL", os.path.join(os.getenv("VLLM_ASCEND_KV_DEBUG_DIR", "./kv_debug"), "ctrl.json"))
+
+
+def _load_ctrl() -> dict:
+    path = _ctrl_path_default()
+    try:
+        st = os.stat(path)
+    except Exception:
+        return {}
+    if _CTRL_CACHE["path"] != path or _CTRL_CACHE["mtime"] < st.st_mtime:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            _CTRL_CACHE["path"] = path
+            _CTRL_CACHE["mtime"] = st.st_mtime
+            _CTRL_CACHE["data"] = data
+        except Exception:
+            return {}
+    return _CTRL_CACHE.get("data") or {}
+
+
 def _get_debug_base_dir() -> str:
+    ctrl = _load_ctrl()
+    if isinstance(ctrl, dict) and ctrl.get("base_dir"):
+        return str(ctrl.get("base_dir"))
     return os.getenv("VLLM_ASCEND_KV_DEBUG_DIR", "./kv_debug")
 
 
 def _is_enabled() -> bool:
+    ctrl = _load_ctrl()
+    if isinstance(ctrl, dict) and "enabled" in ctrl:
+        return bool(ctrl.get("enabled"))
     flag = os.getenv("VLLM_ASCEND_KV_DEBUG", "0")
     return flag in ("1", "true", "True")
 
 
 def _chunked_prefill_enabled() -> bool:
+    # Prefer control file, then env
+    ctrl = _load_ctrl()
+    if isinstance(ctrl, dict):
+        if "chunked" in ctrl:
+            return bool(ctrl.get("chunked"))
+        if "is_chunked" in ctrl:
+            return bool(ctrl.get("is_chunked"))
     # Prefer explicit env from user; support multiple names for convenience
     for name in ("VLLM_ASCEND_CHUNKED_PREFILL", "VLLM_ASCEND_IS_CHUNKED", "VLLM_ASCEND_FORCE_CHUNKED"):
         val = os.getenv(name)
@@ -111,6 +160,12 @@ def _upsert_manifest_entry(manifest: dict, entry: dict) -> dict:
 
 
 def _get_tol() -> tuple[float, float, bool]:
+    ctrl = _load_ctrl()
+    if isinstance(ctrl, dict):
+        strict = bool(ctrl.get("strict", False))
+        rtol = float(ctrl.get("rtol", 1e-3))
+        atol = float(ctrl.get("atol", 1e-3))
+        return rtol, atol, strict
     strict = os.getenv("VLLM_ASCEND_KV_DEBUG_STRICT", "0") in ("1", "true", "True")
     try:
         rtol = float(os.getenv("VLLM_ASCEND_KV_DEBUG_RTOL", "1e-3"))
