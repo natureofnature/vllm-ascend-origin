@@ -139,36 +139,53 @@ def _save_pickle(path: str, obj) -> None:
         pickle.dump(obj, f)
 
 
-def _load_manifest_json(path: str) -> dict:
-    if not os.path.exists(path):
-        return {"version": 1, "entries": []}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"version": 1, "entries": []}
+def _staging_dir(base_dir: str, layer_idx: int, tp_rank: int, sp_rank: int) -> str:
+    return os.path.join(base_dir, "groundtruth", "_staging", f"L{layer_idx}", f"tp{tp_rank}", f"sp{sp_rank}")
 
 
-def _save_manifest_json(path: str, data: dict) -> None:
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-    os.replace(tmp, path)
+def _assembled_path(base_dir: str, layer_idx: int, tp_rank: int, sp_rank: int) -> str:
+    out_dir = os.path.join(base_dir, "groundtruth", f"L{layer_idx}", f"tp{tp_rank}", f"sp{sp_rank}")
+    _ensure_dir(out_dir)
+    return os.path.join(out_dir, "kv.pkl")
 
 
-def _upsert_manifest_entry(manifest: dict, entry: dict) -> dict:
-    entries = manifest.get("entries", [])
-    key_fields = ["layer_idx", "cp_rank", "cp_size", "sp_rank", "sp_size", "tag"]
-    def same_key(a, b):
-        return all(a.get(k) == b.get(k) for k in key_fields)
-    for i, e in enumerate(entries):
-        if same_key(e, entry):
-            entries[i] = entry
+def _save_shard(base_dir: str, layer_idx: int, tp_rank: int, sp_rank: int, cp_rank: int,
+                shard: dict) -> str:
+    sdir = _staging_dir(base_dir, layer_idx, tp_rank, sp_rank)
+    _ensure_dir(sdir)
+    path = os.path.join(sdir, f"cp{cp_rank}.pkl")
+    _save_pickle(path, shard)
+    return path
+
+
+def _try_assemble_gt(base_dir: str, layer_idx: int, tp_rank: int, sp_rank: int, cp_size: int) -> Optional[str]:
+    sdir = _staging_dir(base_dir, layer_idx, tp_rank, sp_rank)
+    shards = []
+    for c in range(cp_size):
+        p = os.path.join(sdir, f"cp{c}.pkl")
+        if not os.path.exists(p):
+            return None
+        shards.append(_load_pickle(p))
+    # Concatenate shards by cp order
+    def _concat(key: str) -> torch.Tensor:
+        ts = [torch.as_tensor(s.get(key)).to(torch.float16) for s in shards]
+        if ts[0].numel() == 0:
+            return torch.empty((0,), dtype=torch.float16)
+        return torch.cat(ts, dim=0)
+    kv_cat = _concat("kv_c_normed")
+    kpe_cat = _concat("k_pe")
+    # Use recover_idx if provided (expect same across shards)
+    recover = None
+    for s in shards:
+        if s.get("recover_idx") is not None:
+            recover = torch.as_tensor(s["recover_idx"], dtype=torch.long)
             break
-    else:
-        entries.append(entry)
-    manifest["entries"] = entries
-    return manifest
+    if recover is not None and kv_cat.numel() > 0 and recover.numel() == kv_cat.shape[0]:
+        kv_cat = kv_cat.index_select(0, recover)
+        kpe_cat = kpe_cat.index_select(0, recover)
+    out_path = _assembled_path(base_dir, layer_idx, tp_rank, sp_rank)
+    _save_pickle(out_path, {"kv_c_normed": kv_cat, "k_pe": kpe_cat})
+    return out_path
 
 
 def _get_tol() -> tuple[float, float, bool]:
@@ -306,83 +323,36 @@ def dump_or_compare_kv(
     }
 
     if _ground_truth_mode():
-        # Write/merge manifest entry for this (layer, cp, sp, tag)
-        overwrite = os.getenv("VLLM_ASCEND_KV_DEBUG_OVERWRITE_GT", "0") in ("1", "true", "True")
-        manifest_data = {} if overwrite else _load_manifest_json(manifest_gt)
-        entry = {
-            "layer_idx": int(layer_idx),
-            "cp_rank": int(cp_rank),
-            "cp_size": int(cp_size),
-            "sp_rank": int(sp_rank),
-            "sp_size": int(sp_size),
-            "tp_rank": eff_tp_rank,
-            "tp_size": eff_tp_size,
-            "tag": str(tag),
-            "num_reqs": int(meta["num_reqs"]),
-            "seq_len": seq_len_list,
-            "kv_path": f"L{layer_idx}/tp{eff_tp_rank}/cp{cp_rank}-sp{sp_rank}/kv.pkl",
-        }
-        manifest_data = _upsert_manifest_entry(manifest_data, entry)
-        _save_manifest_json(manifest_gt, manifest_data)
-        # Per-layer, per-(cp,sp) subdir
-        out_dir = os.path.join(gt_dir, f"L{layer_idx}", f"tp{eff_tp_rank}", f"cp{cp_rank}-sp{sp_rank}")
-        _ensure_dir(out_dir)
-        out_path = os.path.join(out_dir, "kv.pkl")
-        # If this rank has 0 tokens this step, still write an empty tensor to mark presence
-        if total_tokens <= 0:
-            _save_pickle(out_path, {
-                "kv_c_normed": torch.empty((0,), dtype=torch.float16),
-                "k_pe": torch.empty((0,), dtype=torch.float16),
-            })
-        else:
-            _save_pickle(out_path, tensor_dump)
-        logger.info(f"[KVDBG] saved GT kv to {out_path}")
+        # Save per-cp shard to staging, include recover_idx if available
+        shard = dict(tensor_dump)
+        # Try to extract CP recover index from metadata (prefill only)
+        recover_idx = None
+        try:
+            if hasattr(attn_metadata, "prefill") and getattr(attn_metadata.prefill, "cp_kv_recover_idx", None) is not None:
+                recover_idx = attn_metadata.prefill.cp_kv_recover_idx.detach().cpu().to(torch.int64).numpy().tolist()
+        except Exception:
+            recover_idx = None
+        shard["recover_idx"] = recover_idx
+        _save_shard(base_dir, int(layer_idx), eff_tp_rank, sp_rank, cp_rank, shard)
+        # Try assemble combined GT for this TP/SP when all CP shards exist
+        _try_assemble_gt(base_dir, int(layer_idx), eff_tp_rank, sp_rank, cp_size)
         return
 
     # Compare against latest GT with same key
-    gt_dir, manifest_path = _gt_paths(base_dir)
-    if not os.path.exists(manifest_path):
-        logger.warning("[KVDBG] no GT manifest found; run with chunked prefill disabled first")
-        return
+    # Load assembled GT for this layer/tp/sp; try assemble on the fly if missing
+    gt_path = _assembled_path(base_dir, int(layer_idx), eff_tp_rank, sp_rank)
+    if not os.path.exists(gt_path):
+        maybe = _try_assemble_gt(base_dir, int(layer_idx), eff_tp_rank, sp_rank, cp_size)
+        if maybe is None or not os.path.exists(gt_path):
+            logger.warning(f"[KVDBG] GT assembled file missing at {gt_path}")
+            return
     try:
-        manifest_data = _load_manifest_json(manifest_path)
-        # Select matching entry
-        entries = manifest_data.get("entries", [])
-        candidates = [
-            e for e in entries
-            if (e.get("layer_idx") == int(layer_idx) and
-                e.get("cp_rank") == int(cp_rank) and
-                e.get("cp_size") == int(cp_size) and
-                e.get("sp_rank") == int(sp_rank) and
-                e.get("sp_size") == int(sp_size) and
-                e.get("tp_rank", eff_tp_rank) == eff_tp_rank and
-                e.get("tp_size", eff_tp_size) == eff_tp_size)
-        ]
-        if not candidates:
-            # Print brief manifest summary to help align GT/compare settings
-            avail = []
-            for e in entries:
-                if e.get("layer_idx") == int(layer_idx) and e.get("tag") == str(tag):
-                    avail.append(f"cp{e.get('cp_rank')}/{e.get('cp_size')} sp{e.get('sp_rank')}/{e.get('sp_size')} tp{e.get('tp_rank', 'NA')}/{e.get('tp_size', 'NA')}")
-            logger.warning(
-                f"[KVDBG] GT entry not found for L{layer_idx} cp{cp_rank}/{cp_size} sp{sp_rank}/{sp_size} tp{eff_tp_rank}/{eff_tp_size} tag={tag}. "
-                f"Available for this layer/tag: {', '.join(avail) if avail else 'none'}. "
-                f"Ensure GT run used the same cp/sp/tp sizes and all ranks had VLLM_ASCEND_KV_DEBUG=1.")
-            return
-        # Prefer tag match, otherwise take the one with largest total seq tokens
-        tagged = [e for e in candidates if e.get("tag") == str(tag)]
-        chosen = tagged if tagged else candidates
-        match = max(chosen, key=lambda e: sum(e.get("seq_len", [])))
-        gt_seq = match.get("seq_len", [])
-        kv_rel_path = match.get("kv_path")
-        gt_path = os.path.join(gt_dir, kv_rel_path) if kv_rel_path else os.path.join(gt_dir, f"L{layer_idx}", f"tp{eff_tp_rank}", f"cp{cp_rank}-sp{sp_rank}", "kv.pkl")
-        if not os.path.exists(gt_path):
-            logger.warning(f"[KVDBG] GT file missing at {gt_path}")
-            return
         gt = _load_pickle(gt_path)
     except Exception as exc:
         logger.warning(f"[KVDBG] load GT failed: {exc}")
         return
+    # We no longer rely on GT seq_len; slice by current seq_len_list
+    gt_seq = [int(1e12)] * len(seq_len_list)  # effectively infinite, so we take cur lens
 
     # Build expected prefix by slicing GT per-request
     try:
