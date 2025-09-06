@@ -1367,10 +1367,26 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 'tail_attn_nomask_seqlens': tail_attn_nomask_seqlens,
                 'cp_prefill_mask': cp_prefill_mask
             }
+            # For chunked prefill with CP/SP, align per-rank cumulative lengths with
+            # runner's even CP-padded saving so downstream debug/compare uses the
+            # same per-rank lens.
+            if self.chunked_prefill_enabled and (self.cp_size * self.sp_size > 1):
+                num_reqs_eff = self.input_batch.num_reqs
+                computed_tokens_even = [[[0 for _ in range(self.sp_size)] for _ in range(self.cp_size)] for _ in range(num_reqs_eff)]
+                for ridx in range(num_reqs_eff):
+                    base_comp = int(self.input_batch.num_computed_tokens_cpu[ridx])
+                    per_rank_add = int((num_scheduled_tokens_for_slot[ridx] // (self.cp_size * self.sp_size)))
+                    for ci in range(self.cp_size):
+                        for sj in range(self.sp_size):
+                            computed_tokens_even[ridx][ci][sj] = base_comp + per_rank_add
+                num_comp_cp_sp = computed_tokens_even
+            else:
+                num_comp_cp_sp = self.input_batch.num_computed_tokens_of_cp_sp[:self.input_batch.num_reqs]
+
             long_seq_metadata = AscendCommonLongSequenceMetadata(
                 cp_kv_recover_idx=self.cp_kv_recover_idx,
                 num_actual_tokens_cp_full=num_actual_tokens_cp_full,
-                num_computed_tokens_of_cp_sp=self.input_batch.num_computed_tokens_of_cp_sp[:self.input_batch.num_reqs],
+                num_computed_tokens_of_cp_sp=num_comp_cp_sp,
                 q_head_idx_tensor=self.q_head_idx_tensor,
                 q_tail_idx_tensor=self.q_tail_idx_tensor,
                 q_full_idx=self.q_full_idx,
