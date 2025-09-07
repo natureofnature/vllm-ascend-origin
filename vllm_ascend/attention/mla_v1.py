@@ -1492,6 +1492,21 @@ class AscendMLAImpl(MLAAttentionImpl):
                                                        prefill_k_pe, kv_cache,
                                                        attn_metadata)
             current_ms_metadata = get_multistream_comm_context()
+            if self._kv_record_dir:
+                try:
+                    # Use the same step index as KV snapshot (which increments after dump)
+                    step_idx = max(self._kv_record_step - 1, 0)
+                    os.makedirs(self._kv_record_dir, exist_ok=True)
+                    layer_label = f"{self._record_layer_id}"
+                    tag = self._kv_record_tag or "run"
+                    out_path = os.path.join(
+                        self._kv_record_dir,
+                        f"layer{layer_label}_step{step_idx}_cp{self.cp_rank}_sp{self.sp_rank}_attn_{tag}.pkl",
+                    )
+                    with open(out_path, "wb") as f:
+                        pickle.dump({"attn": output_prefill.detach().cpu()}, f)
+                except Exception as e:
+                    logger.warning(f"ATTN record failed: {e}")
             if current_ms_metadata is not None:
                 current_ms_metadata.before_comm_event.record()
                 with torch.npu.stream(current_ms_metadata.comm_stream):

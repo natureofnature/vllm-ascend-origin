@@ -106,6 +106,7 @@ def main():
     ap.add_argument("--atol", type=float, default=1e-3)
     ap.add_argument("--rtol", type=float, default=1e-3)
     ap.add_argument("--expected_tokens", type=int, default=None, help="Optional total tokens to compare (truncate)")
+    ap.add_argument("--compare_attn", default=True)
     args = ap.parse_args()
 
     map_a = _scan(args.dir_a)
@@ -142,6 +143,18 @@ def main():
             if not ok:
                 print(f"First mismatch (pair) key={key}, target_tokens={target}. {msg}")
                 return 1
+        if args.compare_attn:
+            # accumulate attn outputs similarly if available
+            a_attn_list = [p.get("attn") for _, p in sa if p.get("attn") is not None]
+            b_attn_list = [p.get("attn") for _, p in sb if p.get("attn") is not None]
+            if a_attn_list and b_attn_list:
+                a_attn = torch.cat(a_attn_list, dim=0)
+                b_attn = torch.cat(b_attn_list, dim=0)
+                trim = min(a_attn.size(0), b_attn.size(0), target)
+                ok, msg = _first_mismatch(a_attn[:trim], b_attn[:trim], args.atol, args.rtol)
+                if not ok:
+                    print(f"First mismatch (pair) key=attn, target_tokens={trim}. {msg}")
+                    return 1
         print("All compared KV are consistent (pair mode).")
         return 0
 
@@ -158,6 +171,17 @@ def main():
             if not ok:
                 print(f"First mismatch at layer={layer}, key={key}, target_tokens={target}. {msg}")
                 return 1
+        if args.compare_attn:
+            a_attn_list = [p.get("attn") for _, p in sa if p.get("attn") is not None]
+            b_attn_list = [p.get("attn") for _, p in sb if p.get("attn") is not None]
+            if a_attn_list and b_attn_list:
+                a_attn = torch.cat(a_attn_list, dim=0)
+                b_attn = torch.cat(b_attn_list, dim=0)
+                trim = min(a_attn.size(0), b_attn.size(0), target)
+                ok, msg = _first_mismatch(a_attn[:trim], b_attn[:trim], args.atol, args.rtol)
+                if not ok:
+                    print(f"First mismatch at layer={layer}, key=attn, target_tokens={trim}. {msg}")
+                    return 1
 
     print("All compared KV are consistent across layers.")
     return 0
