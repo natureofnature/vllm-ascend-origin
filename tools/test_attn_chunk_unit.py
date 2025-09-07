@@ -10,11 +10,6 @@ except Exception as e:
     print("torch_npu not available:", e)
     sys.exit(2)
 
-"""
-python tools/test_attn_chunk_unit.py --total_tokens 2974 --chunk_size 1024 --num_heads 16 --qk_nope 128 --qk_rope 64 --v_dim 128 --dtype bf16 --atol 1e-3 --rtol 1e-3
-"""
-
-
 
 @torch.inference_mode()
 def ring_attn(q_nope, q_rope, k_nope, k_rope, v, q_len: int, kv_len: int, head_num: int, scale: float):
@@ -38,7 +33,9 @@ def ring_attn(q_nope, q_rope, k_nope, k_rope, v, q_len: int, kv_len: int, head_n
         input_layout="type_bsnd",
         calc_type="calc_type_default",
     )
-    return out, lse
+    # Convert lse to [T, H, 1] for stable update broadcasting
+    lse_bt = lse.permute(1, 0).unsqueeze(-1).contiguous()
+    return out, lse_bt
 
 
 def stable_update(out, lse, block_out, block_lse):
