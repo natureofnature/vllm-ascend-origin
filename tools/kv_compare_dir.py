@@ -60,23 +60,18 @@ def _pick_rep_per_step(m: Dict[Tuple[int, int, int, int], str]) -> Dict[Tuple[in
     for (layer, step), shard_list in buckets.items():
         shard_list.sort()
         kv_fp = None
-        attn_fp = None
-        # prefer cp0,sp0 for each type
+        attn_fps: List[str] = []
+        # prefer cp0,sp0 for KV; collect all shards for ATTN
         for cp, sp, fp in shard_list:
-            if kv_fp is None and ("_attn_" not in fp) and cp == 0 and sp == 0:
-                kv_fp = fp
-            if attn_fp is None and ("_attn_" in fp) and cp == 0 and sp == 0:
-                attn_fp = fp
-        # fallback: pick any
+            if "_attn_" in fp:
+                attn_fps.append(fp)
+            else:
+                if kv_fp is None and cp == 0 and sp == 0:
+                    kv_fp = fp
         if kv_fp is None:
             for _, _, fp in shard_list:
                 if "_attn_" not in fp:
                     kv_fp = fp
-                    break
-        if attn_fp is None:
-            for _, _, fp in shard_list:
-                if "_attn_" in fp:
-                    attn_fp = fp
                     break
         payload: Dict[str, torch.Tensor] = {}
         if kv_fp is not None:
@@ -90,12 +85,16 @@ def _pick_rep_per_step(m: Dict[Tuple[int, int, int, int], str]) -> Dict[Tuple[in
                         payload["k_pe"] = d["k_pe"]
             except Exception:
                 pass
-        if attn_fp is not None:
+        if attn_fps:
             try:
-                with open(attn_fp, "rb") as f:
-                    d = pickle.load(f)
-                if isinstance(d, dict) and "attn" in d:
-                    payload["attn"] = d["attn"]
+                attn_list = []
+                for fp in attn_fps:
+                    with open(fp, "rb") as f:
+                        d = pickle.load(f)
+                    if isinstance(d, dict) and "attn" in d:
+                        attn_list.append(d["attn"])
+                if attn_list:
+                    payload["attn"] = torch.cat(attn_list, dim=0)
             except Exception:
                 pass
         merged[(layer, step)] = payload
