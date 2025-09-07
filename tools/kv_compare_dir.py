@@ -2,25 +2,10 @@ import argparse
 import glob
 import os
 import pickle
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List
 
 import torch
 
-'''
-流程：
-关闭 chunked prefill，创建 flag：
-echo /tmp/kv_off > /tmp/vllm_ascend_kv_dump_dir
-echo off > /tmp/vllm_ascend_kv_dump_tag
-跑一次同样输入，生成 ground truth 于 /tmp/kv_off
-
-开启 chunked prefill，创建 flag：
-echo /tmp/kv_on > /tmp/vllm_ascend_kv_dump_dir
-echo on > /tmp/vllm_ascend_kv_dump_tag
-跑同样输入，生成对比对象于 /tmp/kv_on
-
-对比：
-python tools/kv_compare_dir.py /tmp/kv_off /tmp/kv_on --atol 1e-3 --rtol 1e-3
-'''
 
 def _scan(dir_path: str) -> Dict[Tuple[int, int, int, int], str]:
     """
@@ -33,9 +18,7 @@ def _scan(dir_path: str) -> Dict[Tuple[int, int, int, int], str]:
         bn = os.path.basename(fp)
         try:
             parts = bn.split("_")
-            # layer{L}
             layer = int(parts[0].replace("layer", ""))
-            # step{S}
             step = int(parts[1].replace("step", ""))
             cp = 0
             sp = 0
@@ -46,7 +29,6 @@ def _scan(dir_path: str) -> Dict[Tuple[int, int, int, int], str]:
                     sp = int(part.replace("sp", ""))
             out[(layer, step, cp, sp)] = fp
         except Exception:
-            # fallback older naming: layer{L}_step{S}_{tag}.pkl
             try:
                 ls, rest = bn.split("_step", 1)
                 layer = int(ls.replace("layer", ""))
@@ -70,110 +52,114 @@ def _first_mismatch(a: torch.Tensor, b: torch.Tensor, atol: float, rtol: float):
     return (False, f"value mismatch, first_flat_index={first}")
 
 
+def _pick_rep_per_step(m: Dict[Tuple[int, int, int, int], str]) -> Dict[Tuple[int, int], Dict[str, torch.Tensor]]:
+    merged: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+    buckets: Dict[Tuple[int, int], List[Tuple[int, int, str]]] = {}
+    for (layer, step, cp, sp), fp in m.items():
+        buckets.setdefault((layer, step), []).append((cp, sp, fp))
+    for (layer, step), shard_list in buckets.items():
+        shard_list.sort()
+        pick = None
+        for cp, sp, fp in shard_list:
+            if cp == 0 and sp == 0:
+                pick = fp
+                break
+        if pick is None:
+            pick = shard_list[0][2]
+        with open(pick, "rb") as f:
+            merged[(layer, step)] = pickle.load(f)
+    return merged
+
+
+def _series_by_layer(rep: Dict[Tuple[int, int], Dict[str, torch.Tensor]]):
+    by_layer: Dict[int, List[Tuple[int, Dict[str, torch.Tensor]]]] = {}
+    for (layer, step), payload in rep.items():
+        by_layer.setdefault(layer, []).append((step, payload))
+    for layer in by_layer:
+        by_layer[layer].sort(key=lambda x: x[0])
+    return by_layer
+
+
+def _concat_upto(series: List[Tuple[int, Dict[str, torch.Tensor]]], target_len: int):
+    kv_list = []
+    kpe_list = []
+    acc = 0
+    for _, p in series:
+        kv = p["kv_c"]
+        kpe = p["k_pe"]
+        need = target_len - acc
+        if need <= 0:
+            break
+        take = min(need, kv.size(0))
+        kv_list.append(kv[:take])
+        kpe_list.append(kpe[:take])
+        acc += take
+    kv_cat = torch.cat(kv_list, dim=0) if len(kv_list) > 1 else (kv_list[0] if kv_list else torch.empty(0))
+    kpe_cat = torch.cat(kpe_list, dim=0) if len(kpe_list) > 1 else (kpe_list[0] if kpe_list else torch.empty(0))
+    return kv_cat, kpe_cat
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dir_a", type=str, help="ground truth dir (chunked prefill OFF)")
     ap.add_argument("dir_b", type=str, help="compare dir (chunked prefill ON)")
     ap.add_argument("--atol", type=float, default=1e-3)
     ap.add_argument("--rtol", type=float, default=1e-3)
+    ap.add_argument("--expected_tokens", type=int, default=None, help="Optional total tokens to compare (truncate)")
     args = ap.parse_args()
 
     map_a = _scan(args.dir_a)
     map_b = _scan(args.dir_b)
 
-    # Merge shards (cp,sp) per (layer, step) by concatenating on sequence dim
-    def load_merge(m: Dict[Tuple[int, int, int, int], str]):
-        """
-        Prefill路径：各CP在写cache前做了all_gather+重排，KV应一致。
-        因此这里不再拼接各分片，而是优先取 (cp=0, sp=0) 的分片作为代表；
-        若不存在则取 (cp,sp) 最小的一个，并可选做形状一致性检查。
-        """
-        merged: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
-        buckets: Dict[Tuple[int, int], list[Tuple[int, int, str]]] = {}
-        for (layer, step, cp, sp), fp in m.items():
-            buckets.setdefault((layer, step), []).append((cp, sp, fp))
-        for (layer, step), shard_list in buckets.items():
-            shard_list_sorted = sorted(shard_list)
-            # prefer cp=0,sp=0
-            pick = None
-            for cp, sp, fp in shard_list_sorted:
-                if cp == 0 and sp == 0:
-                    pick = (cp, sp, fp)
-                    break
-            if pick is None:
-                pick = shard_list_sorted[0]
-            with open(pick[2], "rb") as f:
-                payload = pickle.load(f)
-            # optional: shape check across shards
-            try:
-                base_kv = payload["kv_c"].shape
-                for _, _, fp in shard_list_sorted[1:]:
-                    with open(fp, "rb") as f2:
-                        p2 = pickle.load(f2)
-                    if p2["kv_c"].shape != base_kv:
-                        print(f"[warn] shape differs among shards at layer={layer}, step={step}: {base_kv} vs {p2['kv_c'].shape}")
-                        break
-            except Exception:
-                pass
-            merged[(layer, step)] = payload
-        return merged
+    rep_a = _pick_rep_per_step(map_a)
+    rep_b = _pick_rep_per_step(map_b)
 
-    A = load_merge(map_a)
-    B = load_merge(map_b)
+    A = _series_by_layer(rep_a)
+    B = _series_by_layer(rep_b)
 
-    keys = sorted(set(A.keys()) & set(B.keys()))
-    if not keys:
-        # Fallback: try step-only join if layer ids differ
-        steps_a = sorted({s for (_, s) in A.keys()})
-        steps_b = sorted({s for (_, s) in B.keys()})
-        steps = sorted(set(steps_a) & set(steps_b))
-        if not steps:
-            print("No overlapping (layer, step) after merge. Check inputs.")
+    layers = sorted(set(A.keys()) & set(B.keys()))
+    pair_mode = False
+    if not layers:
+        if not A or not B:
+            print("No overlapping layers. Check inputs.")
             return 2
-        for s in steps:
-            # Pick smallest layer id per side for this step
-            la = min([l for (l, ss) in A.keys() if ss == s])
-            lb = min([l for (l, ss) in B.keys() if ss == s])
-            pa = A[(la, s)]
-            pb = B[(lb, s)]
-            for key in ("kv_c", "k_pe"):
-                if key not in pa or key not in pb:
-                    print(f"[fallback S{s}] missing key {key}")
-                    return 2
-                ok, msg = _first_mismatch(pa[key], pb[key], args.atol, args.rtol)
-                if not ok:
-                    a = pa[key]
-                    flat_len_per_token = a.shape[1] if a.dim() == 2 else 1
-                    diff = (pa[key] - pb[key]).abs()
-                    mask = diff > (args.atol + args.rtol * pb[key].abs())
-                    idx = mask.view(-1).nonzero(as_tuple=False)
-                    first = int(idx[0]) if idx.numel() > 0 else -1
-                    token_idx = first // flat_len_per_token if flat_len_per_token > 0 and first >= 0 else -1
-                    print(f"First mismatch at step={s}, key={key}, token_idx={token_idx}. {msg}")
-                    return 1
-        print("All compared KV are consistent across steps (fallback mode).")
+        la = min(A.keys())
+        lb = min(B.keys())
+        layers = [(la, lb)]
+        pair_mode = True
+
+    if pair_mode:
+        la, lb = layers[0]
+        sa = A[la]
+        sb = B[lb]
+        total_a = sum([p["kv_c"].size(0) for _, p in sa])
+        total_b = sum([p["kv_c"].size(0) for _, p in sb])
+        target = args.expected_tokens if args.expected_tokens is not None else min(total_a, total_b)
+        a_kv, a_kpe = _concat_upto(sa, target)
+        b_kv, b_kpe = _concat_upto(sb, target)
+        for key, ta, tb in (("kv_c", a_kv, b_kv), ("k_pe", a_kpe, b_kpe)):
+            ok, msg = _first_mismatch(ta, tb, args.atol, args.rtol)
+            if not ok:
+                print(f"First mismatch (pair) key={key}, target_tokens={target}. {msg}")
+                return 1
+        print("All compared KV are consistent (pair mode).")
         return 0
 
-    for (layer, step) in keys:
-        pa = A[(layer, step)]
-        pb = B[(layer, step)]
-        for key in ("kv_c", "k_pe"):
-            if key not in pa or key not in pb:
-                print(f"[L{layer} S{step}] missing key {key}")
-                return 2
-            ok, msg = _first_mismatch(pa[key], pb[key], args.atol, args.rtol)
+    for layer in layers:
+        sa = A[layer]
+        sb = B[layer]
+        total_a = sum([p["kv_c"].size(0) for _, p in sa])
+        total_b = sum([p["kv_c"].size(0) for _, p in sb])
+        target = args.expected_tokens if args.expected_tokens is not None else min(total_a, total_b)
+        a_kv, a_kpe = _concat_upto(sa, target)
+        b_kv, b_kpe = _concat_upto(sb, target)
+        for key, ta, tb in (("kv_c", a_kv, b_kv), ("k_pe", a_kpe, b_kpe)):
+            ok, msg = _first_mismatch(ta, tb, args.atol, args.rtol)
             if not ok:
-                a = pa[key]
-                flat_len_per_token = a.shape[1] if a.dim() == 2 else 1
-                diff = (pa[key] - pb[key]).abs()
-                mask = diff > (args.atol + args.rtol * pb[key].abs())
-                idx = mask.view(-1).nonzero(as_tuple=False)
-                first = int(idx[0]) if idx.numel() > 0 else -1
-                token_idx = first // flat_len_per_token if flat_len_per_token > 0 and first >= 0 else -1
-                print(f"First mismatch at layer={layer}, step={step}, key={key}, token_idx={token_idx}. {msg}")
+                print(f"First mismatch at layer={layer}, key={key}, target_tokens={target}. {msg}")
                 return 1
 
-    print("All compared KV are consistent across layers/steps.")
+    print("All compared KV are consistent across layers.")
     return 0
 
 
