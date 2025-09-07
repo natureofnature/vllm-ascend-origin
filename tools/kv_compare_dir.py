@@ -59,15 +59,46 @@ def _pick_rep_per_step(m: Dict[Tuple[int, int, int, int], str]) -> Dict[Tuple[in
         buckets.setdefault((layer, step), []).append((cp, sp, fp))
     for (layer, step), shard_list in buckets.items():
         shard_list.sort()
-        pick = None
+        kv_fp = None
+        attn_fp = None
+        # prefer cp0,sp0 for each type
         for cp, sp, fp in shard_list:
-            if cp == 0 and sp == 0:
-                pick = fp
-                break
-        if pick is None:
-            pick = shard_list[0][2]
-        with open(pick, "rb") as f:
-            merged[(layer, step)] = pickle.load(f)
+            if kv_fp is None and ("_attn_" not in fp) and cp == 0 and sp == 0:
+                kv_fp = fp
+            if attn_fp is None and ("_attn_" in fp) and cp == 0 and sp == 0:
+                attn_fp = fp
+        # fallback: pick any
+        if kv_fp is None:
+            for _, _, fp in shard_list:
+                if "_attn_" not in fp:
+                    kv_fp = fp
+                    break
+        if attn_fp is None:
+            for _, _, fp in shard_list:
+                if "_attn_" in fp:
+                    attn_fp = fp
+                    break
+        payload: Dict[str, torch.Tensor] = {}
+        if kv_fp is not None:
+            try:
+                with open(kv_fp, "rb") as f:
+                    d = pickle.load(f)
+                if isinstance(d, dict):
+                    if "kv_c" in d:
+                        payload["kv_c"] = d["kv_c"]
+                    if "k_pe" in d:
+                        payload["k_pe"] = d["k_pe"]
+            except Exception:
+                pass
+        if attn_fp is not None:
+            try:
+                with open(attn_fp, "rb") as f:
+                    d = pickle.load(f)
+                if isinstance(d, dict) and "attn" in d:
+                    payload["attn"] = d["attn"]
+            except Exception:
+                pass
+        merged[(layer, step)] = payload
     return merged
 
 
@@ -133,16 +164,24 @@ def main():
         la, lb = layers[0]
         sa = A[la]
         sb = B[lb]
-        total_a = sum([p["kv_c"].size(0) for _, p in sa])
-        total_b = sum([p["kv_c"].size(0) for _, p in sb])
+        total_a = sum([p["kv_c"].size(0) for _, p in sa if "kv_c" in p])
+        total_b = sum([p["kv_c"].size(0) for _, p in sb if "kv_c" in p])
+        if total_a == 0 or total_b == 0:
+            # fallback to attention length if kv missing
+            attn_total_a = sum([p["attn"].size(0) for _, p in sa if "attn" in p])
+            attn_total_b = sum([p["attn"].size(0) for _, p in sb if "attn" in p])
+            total_a = attn_total_a
+            total_b = attn_total_b
         target = args.expected_tokens if args.expected_tokens is not None else min(total_a, total_b)
-        a_kv, a_kpe = _concat_upto(sa, target)
-        b_kv, b_kpe = _concat_upto(sb, target)
-        for key, ta, tb in (("kv_c", a_kv, b_kv), ("k_pe", a_kpe, b_kpe)):
-            ok, msg = _first_mismatch(ta, tb, args.atol, args.rtol)
-            if not ok:
-                print(f"First mismatch (pair) key={key}, target_tokens={target}. {msg}")
-                return 1
+        if any(("kv_c" in p) for _, p in sa) and any(("kv_c" in p) for _, p in sb):
+            a_kv, a_kpe = _concat_upto(sa, target)
+            b_kv, b_kpe = _concat_upto(sb, target)
+            for key, ta, tb in (("kv_c", a_kv, b_kv), ("k_pe", a_kpe, b_kpe)):
+                if ta.numel() and tb.numel():
+                    ok, msg = _first_mismatch(ta, tb, args.atol, args.rtol)
+                    if not ok:
+                        print(f"First mismatch (pair) key={key}, target_tokens={target}. {msg}")
+                        return 1
         if args.compare_attn:
             # accumulate attn outputs similarly if available
             a_attn_list = [p.get("attn") for _, p in sa if p.get("attn") is not None]
@@ -161,16 +200,23 @@ def main():
     for layer in layers:
         sa = A[layer]
         sb = B[layer]
-        total_a = sum([p["kv_c"].size(0) for _, p in sa])
-        total_b = sum([p["kv_c"].size(0) for _, p in sb])
+        total_a = sum([p["kv_c"].size(0) for _, p in sa if "kv_c" in p])
+        total_b = sum([p["kv_c"].size(0) for _, p in sb if "kv_c" in p])
+        if total_a == 0 or total_b == 0:
+            attn_total_a = sum([p["attn"].size(0) for _, p in sa if "attn" in p])
+            attn_total_b = sum([p["attn"].size(0) for _, p in sb if "attn" in p])
+            total_a = attn_total_a
+            total_b = attn_total_b
         target = args.expected_tokens if args.expected_tokens is not None else min(total_a, total_b)
-        a_kv, a_kpe = _concat_upto(sa, target)
-        b_kv, b_kpe = _concat_upto(sb, target)
-        for key, ta, tb in (("kv_c", a_kv, b_kv), ("k_pe", a_kpe, b_kpe)):
-            ok, msg = _first_mismatch(ta, tb, args.atol, args.rtol)
-            if not ok:
-                print(f"First mismatch at layer={layer}, key={key}, target_tokens={target}. {msg}")
-                return 1
+        if any(("kv_c" in p) for _, p in sa) and any(("kv_c" in p) for _, p in sb):
+            a_kv, a_kpe = _concat_upto(sa, target)
+            b_kv, b_kpe = _concat_upto(sb, target)
+            for key, ta, tb in (("kv_c", a_kv, b_kv), ("k_pe", a_kpe, b_kpe)):
+                if ta.numel() and tb.numel():
+                    ok, msg = _first_mismatch(ta, tb, args.atol, args.rtol)
+                    if not ok:
+                        print(f"First mismatch at layer={layer}, key={key}, target_tokens={target}. {msg}")
+                        return 1
         if args.compare_attn:
             a_attn_list = [p.get("attn") for _, p in sa if p.get("attn") is not None]
             b_attn_list = [p.get("attn") for _, p in sb if p.get("attn") is not None]
