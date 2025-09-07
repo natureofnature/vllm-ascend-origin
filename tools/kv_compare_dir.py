@@ -104,8 +104,36 @@ def main():
 
     keys = sorted(set(A.keys()) & set(B.keys()))
     if not keys:
-        print("No overlapping (layer, step) after merge. Check inputs.")
-        return 2
+        # Fallback: try step-only join if layer ids differ
+        steps_a = sorted({s for (_, s) in A.keys()})
+        steps_b = sorted({s for (_, s) in B.keys()})
+        steps = sorted(set(steps_a) & set(steps_b))
+        if not steps:
+            print("No overlapping (layer, step) after merge. Check inputs.")
+            return 2
+        for s in steps:
+            # Pick smallest layer id per side for this step
+            la = min([l for (l, ss) in A.keys() if ss == s])
+            lb = min([l for (l, ss) in B.keys() if ss == s])
+            pa = A[(la, s)]
+            pb = B[(lb, s)]
+            for key in ("kv_c", "k_pe"):
+                if key not in pa or key not in pb:
+                    print(f"[fallback S{s}] missing key {key}")
+                    return 2
+                ok, msg = _first_mismatch(pa[key], pb[key], args.atol, args.rtol)
+                if not ok:
+                    a = pa[key]
+                    flat_len_per_token = a.shape[1] if a.dim() == 2 else 1
+                    diff = (pa[key] - pb[key]).abs()
+                    mask = diff > (args.atol + args.rtol * pb[key].abs())
+                    idx = mask.view(-1).nonzero(as_tuple=False)
+                    first = int(idx[0]) if idx.numel() > 0 else -1
+                    token_idx = first // flat_len_per_token if flat_len_per_token > 0 and first >= 0 else -1
+                    print(f"First mismatch at step={s}, key={key}, token_idx={token_idx}. {msg}")
+                    return 1
+        print("All compared KV are consistent across steps (fallback mode).")
+        return 0
 
     for (layer, step) in keys:
         pa = A[(layer, step)]

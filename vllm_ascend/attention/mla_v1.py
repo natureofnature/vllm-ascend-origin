@@ -540,6 +540,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.sp_size = get_tensor_model_parallel_world_size() if self.enable_sp else 1
         self.sp_rank = get_tensor_model_parallel_rank() if self.enable_sp else 0
         self.sp_group = get_tp_group().device_group
+        # Stable per-layer recording id across runs (assuming deterministic init order)
+        if not hasattr(AscendMLAImpl, "_record_counter"):
+            AscendMLAImpl._record_counter = 0  # type: ignore[attr-defined]
+        self._record_layer_id = int(AscendMLAImpl._record_counter)  # type: ignore[attr-defined]
+        AscendMLAImpl._record_counter += 1  # type: ignore[attr-defined]
         # KV record (opt-in via flag files, robust across processes)
         # Enable by creating /tmp/vllm_ascend_kv_dump_dir (content=output dir)
         # Optional tag by creating /tmp/vllm_ascend_kv_dump_tag (content=tag)
@@ -1416,8 +1421,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             if self._kv_record_dir and attn_metadata.num_prefills > 0:
                 try:
                     os.makedirs(self._kv_record_dir, exist_ok=True)
-                    layer_idx = getattr(layer, "layer_idx", None)
-                    layer_label = f"{layer_idx}" if layer_idx is not None else str(id(self))
+                    layer_label = f"{self._record_layer_id}"
                     tag = self._kv_record_tag or "run"
                     payload = {
                         "kv_c": prefill_k_c_normed.detach().cpu(),
@@ -1443,8 +1447,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         if self._kv_record_dir and has_prefill and attn_metadata.prefill is not None:
             try:
                 os.makedirs(self._kv_record_dir, exist_ok=True)
-                layer_idx = getattr(layer, "layer_idx", None)
-                layer_label = f"{layer_idx}" if layer_idx is not None else str(id(self))
+                layer_label = f"{self._record_layer_id}"
                 tag = self._kv_record_tag or "run"
                 # Use cumulative seq_lens for full-history snapshot
                 seq_lens_rec = torch.tensor(attn_metadata.prefill.context_lens, dtype=torch.int32, device=kv_cache[0].device)
