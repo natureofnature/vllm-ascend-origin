@@ -12,10 +12,12 @@ import torch
 echo /tmp/kv_off > /tmp/vllm_ascend_kv_dump_dir
 echo off > /tmp/vllm_ascend_kv_dump_tag
 跑一次同样输入，生成 ground truth 于 /tmp/kv_off
+
 开启 chunked prefill，创建 flag：
 echo /tmp/kv_on > /tmp/vllm_ascend_kv_dump_dir
 echo on > /tmp/vllm_ascend_kv_dump_tag
 跑同样输入，生成对比对象于 /tmp/kv_on
+
 对比：
 python tools/kv_compare_dir.py /tmp/kv_off /tmp/kv_on --atol 1e-3 --rtol 1e-3
 '''
