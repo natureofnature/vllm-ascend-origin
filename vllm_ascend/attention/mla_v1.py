@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Tuple, Type, TypeVar
+import os
+import pickle
 
 import numpy as np
 import torch
@@ -538,6 +540,24 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.sp_size = get_tensor_model_parallel_world_size() if self.enable_sp else 1
         self.sp_rank = get_tensor_model_parallel_rank() if self.enable_sp else 0
         self.sp_group = get_tp_group().device_group
+        # KV record (opt-in via flag files, robust across processes)
+        # Enable by creating /tmp/vllm_ascend_kv_dump_dir (content=output dir)
+        # Optional tag by creating /tmp/vllm_ascend_kv_dump_tag (content=tag)
+        self._kv_record_dir: Optional[str] = None
+        self._kv_record_tag: Optional[str] = None
+        try:
+            dir_flag = "/tmp/vllm_ascend_kv_dump_dir"
+            tag_flag = "/tmp/vllm_ascend_kv_dump_tag"
+            if os.path.exists(dir_flag):
+                with open(dir_flag, "r") as f:
+                    self._kv_record_dir = f.read().strip() or None
+            if os.path.exists(tag_flag):
+                with open(tag_flag, "r") as f:
+                    self._kv_record_tag = f.read().strip() or None
+        except Exception:
+            self._kv_record_dir = None
+            self._kv_record_tag = None
+        self._kv_record_step: int = 0
 
     def _v_up_proj_and_o_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
@@ -1392,12 +1412,59 @@ class AscendMLAImpl(MLAAttentionImpl):
             kv_c_normed, k_pe = prefill_k_c_normed, prefill_k_pe
             prefill_k_c_normed = prefill_k_c_normed.squeeze()
 
+            # Optional: record unified KV (after CP gather & reorder) per layer step
+            if self._kv_record_dir and attn_metadata.num_prefills > 0:
+                try:
+                    os.makedirs(self._kv_record_dir, exist_ok=True)
+                    layer_idx = getattr(layer, "layer_idx", None)
+                    layer_label = f"{layer_idx}" if layer_idx is not None else str(id(self))
+                    tag = self._kv_record_tag or "run"
+                    payload = {
+                        "kv_c": prefill_k_c_normed.detach().cpu(),
+                        "k_pe": prefill_k_pe.detach().cpu(),
+                    }
+                    out_path = os.path.join(
+                        self._kv_record_dir,
+                        f"layer{layer_label}_step{self._kv_record_step}_cp{self.cp_rank}_sp{self.sp_rank}_{tag}.pkl",
+                    )
+                    with open(out_path, "wb") as f:
+                        pickle.dump(payload, f)
+                    self._kv_record_step += 1
+                except Exception as e:
+                    logger.warning(f"KV record failed: {e}")
+
         torch_npu._npu_reshape_and_cache(
             key=kv_c_normed,
             value=k_pe,
             key_cache=kv_cache[0],
             value_cache=kv_cache[1],
             slot_indices=attn_metadata.slot_mapping)
+        # Optional: dump full KV cache snapshot after updating cache (prefill only)
+        if self._kv_record_dir and has_prefill and attn_metadata.prefill is not None:
+            try:
+                os.makedirs(self._kv_record_dir, exist_ok=True)
+                layer_idx = getattr(layer, "layer_idx", None)
+                layer_label = f"{layer_idx}" if layer_idx is not None else str(id(self))
+                tag = self._kv_record_tag or "run"
+                # Use cumulative seq_lens for full-history snapshot
+                seq_lens_rec = torch.tensor(attn_metadata.prefill.context_lens, dtype=torch.int32, device=kv_cache[0].device)
+                seq_starts_rec = torch.zeros_like(seq_lens_rec, dtype=torch.int32, device=kv_cache[0].device)
+                kv_c_all, k_pe_all = torch_npu.atb.npu_paged_cache_load(
+                    kv_cache[0], kv_cache[1], attn_metadata.prefill.block_table, seq_lens_rec, seq_starts_rec
+                )
+                payload = {
+                    "kv_c": kv_c_all.squeeze(1).detach().cpu(),
+                    "k_pe": k_pe_all.squeeze(1).detach().cpu(),
+                }
+                out_path = os.path.join(
+                    self._kv_record_dir,
+                    f"layer{layer_label}_step{self._kv_record_step}_cp{self.cp_rank}_sp{self.sp_rank}_{tag}.pkl",
+                )
+                with open(out_path, "wb") as f:
+                    pickle.dump(payload, f)
+                self._kv_record_step += 1
+            except Exception as e:
+                logger.warning(f"KV snapshot failed: {e}")
         o_proj_input_shape = (num_actual_toks,
                               self.num_heads * self.v_head_dim)
         o_proj_input = torch.empty(o_proj_input_shape,
