@@ -1100,6 +1100,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         for i in range(self.input_batch.num_reqs):
             block_table_req = block_table_cpu[i]
             block_table_indices = np.repeat(block_table_req, self.block_size)
+            # 使用调度阶段计算的各 rank 保存总数，保证与 KV 写入/读取顺序一致
             num_save_tokens_rank = num_computed_and_new_tokens_batch[i][self.cp_rank][self.sp_rank]
 
             positions_for_slot = self.arange_np[:num_save_tokens_rank]
@@ -1107,8 +1108,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             slot_mapping = (block_table_indices * self.block_size)[:num_save_tokens_rank] + block_offsets
 
             num_cp_padded_scheduled_tokens = num_scheduled_tokens_for_slot[i]
-            kv_save_start = np.sum(num_computed_and_new_tokens_batch[i][:self.cp_rank]) + np.sum(
-                num_computed_and_new_tokens_batch[i][self.cp_rank][:self.sp_rank])
+            # 计算在本步连续缓冲区内的起始偏移：为该请求在本步内，位于 (cp, sp) 前所有 rank 的保存数量之和
+            kv_save_start = np.sum(num_computed_and_new_tokens_batch[i][:self.cp_rank]) + \
+                np.sum(num_computed_and_new_tokens_batch[i][self.cp_rank][:self.sp_rank])
 
             self.slot_mapping_np[
             start_index + kv_save_start:start_index + kv_save_start + num_save_tokens_rank] = slot_mapping
@@ -1150,6 +1152,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        logger.info(f"**** number of scheduled tokens: {total_num_scheduled_tokens}****")
 
         is_prefill = list(scheduler_output.num_scheduled_tokens.values())[0] > 1
 
@@ -1172,12 +1175,22 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
             if self.cp_size > 1 and num_tokens > 1:
                 # when cp > 1 & prefill, need to pad & split sequence here
+                # 在 chunked prefill 下，需要传入"当前步结束后的累计 tokens 数"，
+                # 否则只有 chunk 大小时会被当成总长度，导致本步长度为 0。
+                total_tokens_after_step = (
+                    self.input_batch.num_computed_tokens_cpu[i] + num_tokens
+                    if self.chunked_prefill_enabled else num_tokens
+                )
                 req_position_cp, num_cp_padded_scheduled_tokens, num_cp_pads[i] = self._num_scheduled_tokens_prefill_cp(
-                    num_tokens, self.input_batch.num_computed_tokens_cpu[i])
+                    total_tokens_after_step, self.input_batch.num_computed_tokens_cpu[i])
                 num_tokens = len(req_position_cp)
                 self.position_cp[start_index:start_index + num_tokens] = req_position_cp
                 start_index += num_tokens
                 num_scheduled_tokens_for_slot[i] = num_cp_padded_scheduled_tokens
+                logger.info(
+                    f"=====> [MR-PREFILL-CP] req={req_id} sched_tokens={scheduler_output.num_scheduled_tokens[req_id]} "
+                    f"cum_before={self.input_batch.num_computed_tokens_cpu[i]} pos_cp.len={len(req_position_cp)} "
+                    f"cp_pad_sched={num_cp_padded_scheduled_tokens}")
             else:
                 num_scheduled_tokens_for_slot[i] = num_tokens
             num_scheduled_tokens[i] = num_tokens
@@ -1261,19 +1274,33 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         positions = self.positions[:num_input_tokens]
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
 
-        self.seq_lens_np[:num_reqs] = (
-            self.input_batch.num_computed_tokens_cpu[:num_reqs] +
-            num_scheduled_tokens)
+        # For CP prefill, downstream MLA uses per-step query lengths to split Q,
+        # so set seq_lens to current-step scheduled lengths to avoid inflating to
+        # (computed + query). Keep original cumulative behavior for other cases.
+        if self.cp_size > 1 and is_prefill:
+            self.seq_lens_np[:num_reqs] = num_scheduled_tokens
+        else:
+            self.seq_lens_np[:num_reqs] = (
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+                num_scheduled_tokens)
         seq_lens_cpu = self.seq_lens_cpu[:num_reqs]
         seq_lens = self.seq_lens_cpu[:num_reqs]
+        logger.info(
+            f"=====> [MR-PREFILL] cp={self.cp_size} sp={self.sp_size} num_reqs={num_reqs} "
+            f"query_lens.shape={self.query_lens.shape} seq_lens.shape={seq_lens.shape}")
 
         if self.cp_size * self.sp_size > 1:
             if is_prefill:
                 self.slot_mapping_np.fill(-1)
                 self._slot_mapping_prefill_cp(num_scheduled_tokens_for_slot)
+                logger.info(
+                    f"=====> [MR-SLOT] PREFILL-CP slot_mapping.shape={self.slot_mapping_np.shape} "
+                    f"per_req_cp_pad_sched={num_scheduled_tokens_for_slot}")
             else:
                 self.slot_mapping_np.fill(-1)
                 self._slot_mapping_decode_cp(num_scheduled_tokens)
+                logger.info(
+                    f"=====> [MR-SLOT] DECODE-CP slot_mapping.shape={self.slot_mapping_np.shape} per_req_sched={num_scheduled_tokens}")
         else:
             block_table_indices = (req_indices * self.max_num_blocks_per_req +
                                    positions_np // self.block_size)
@@ -1387,6 +1414,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 'tail_attn_nomask_seqlens': tail_attn_nomask_seqlens,
                 'cp_prefill_mask': cp_prefill_mask
             }
+            logger.info(
+                f"=====> [MR-LONG] chunk_seqlens.len={len(chunk_seqlens)} q_head_idx.len={len(q_head_idx)} q_tail_idx.len={len(q_tail_idx)} "
+                f"attn_mask_seqlens.shape={attn_mask_seqlens.shape} head_nomask_seqlens.shape={head_attn_nomask_seqlens.shape} "
+                f"tail_nomask_seqlens.shape={tail_attn_nomask_seqlens.shape} cp_mask.shape={cp_prefill_mask.shape}")
             long_seq_metadata = AscendCommonLongSequenceMetadata(
                 cp_kv_recover_idx=self.cp_kv_recover_idx,
                 num_actual_tokens_cp_full=num_actual_tokens_cp_full,
