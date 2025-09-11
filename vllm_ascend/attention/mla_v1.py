@@ -563,6 +563,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Load dump config once per process
         if not hasattr(AscendMLAImpl, "_dump_cfg"):
             AscendMLAImpl._dump_cfg = self._load_dump_cfg()
+        # Step index for chunked prefill dumps
+        self._prefill_step_idx: int = 0
 
     @classmethod
     def _load_dump_cfg(cls) -> dict:
@@ -621,7 +623,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         except Exception:
             return 0
 
-    def _maybe_dump_pickle(self, tag: str, payload: dict) -> None:
+    def _maybe_dump_pickle(self, tag: str, payload: dict, step: int | None = None) -> None:
         if not self._dump_enabled():
             return
         dump_dir = self._dump_dir()
@@ -629,8 +631,9 @@ class AscendMLAImpl(MLAAttentionImpl):
             os.makedirs(dump_dir, exist_ok=True)
         except Exception:
             pass
-        ts = time.time_ns()
-        fname = f"{dump_dir}/layer{self.layer_id}_cp{self.cp_rank}_sp{get_tensor_model_parallel_rank() if self.sp_group else 0}_{tag}_{ts}.pkl"
+        tp_rank = get_tensor_model_parallel_rank() if self.sp_group else 0
+        step_seg = f"_step{int(step)}" if step is not None else ""
+        fname = f"{dump_dir}/layer{self.layer_id}_cp{self.cp_rank}_sp{tp_rank}{step_seg}_{tag}.pkl"
         try:
             with open(fname, "wb") as f:
                 pickle.dump(payload, f)
@@ -1377,6 +1380,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     decode_ql_nope, decode_q_pe, decode_k_nope, decode_k_pe)
         # Preprocess for prefill tokens
         if has_prefill:
+            # capture current step for chunked prefill (same for KV and output in this call)
+            _dump_step = self._prefill_step_idx
             prefill_kv_no_split = kv_no_split[
                 num_decode_tokens:num_actual_tokens]
             prefill_q_c = q_c[num_decode_tokens:num_actual_tokens]
@@ -1420,8 +1425,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                 if self._dump_enabled() and self.cp_rank == 0:
                     try:
                         max_blocks_dump = self._dump_kv_blocks()
-                        kv0 = kv_cache[0][:max_blocks_dump].detach().cpu().to(torch.float32)
-                        kv1 = kv_cache[1][:max_blocks_dump].detach().cpu().to(torch.float32)
+                        if max_blocks_dump and max_blocks_dump > 0:
+                            kv0 = kv_cache[0][:max_blocks_dump].detach().cpu().to(torch.float32)
+                            kv1 = kv_cache[1][:max_blocks_dump].detach().cpu().to(torch.float32)
+                        else:
+                            kv0 = kv_cache[0].detach().cpu().to(torch.float32)
+                            kv1 = kv_cache[1].detach().cpu().to(torch.float32)
                         self._maybe_dump_pickle(
                             tag="kv_prefill",
                             payload={
@@ -1431,6 +1440,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                 "kv_rope_blocks": kv1.numpy(),
                                 "block_size": int(kv_cache[0].shape[1]) if len(kv_cache[0].shape) > 1 else None,
                             },
+                            step=_dump_step,
                         )
                     except Exception:
                         pass
@@ -1705,9 +1715,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                             "out_shape": tuple(out_g.shape),
                             "out_fp32_head": out_g.to(torch.float32).cpu().numpy(),
                         },
+                        step=_dump_step,
                     )
                 except Exception:
                     pass
+            # increase step after finishing prefill path in this layer
+            self._prefill_step_idx += 1
             current_ms_metadata = get_multistream_comm_context()
             if current_ms_metadata is not None:
                 with torch.npu.stream(current_ms_metadata.comm_stream):
