@@ -35,6 +35,10 @@ from vllm_ascend.multistream.ms_split import model_input_split_v1_mla_attn
 from vllm_ascend.ops.attention import vanilla_chunked_prefill_mla
 from vllm_ascend.utils import npu_prefetch
 from vllm_ascend.worker.npu_input_batch import InputBatch
+import os
+import json
+import pickle
+import time
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -549,6 +553,80 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.cp_rank = get_context_model_parallel_rank()
         self.cp_group = get_cp_group().device_group
         self.sp_group = get_tp_group().device_group
+
+        # Debug: assign a stable layer id per MLAImpl instance
+        if not hasattr(AscendMLAImpl, "_layer_id_counter"):
+            AscendMLAImpl._layer_id_counter = 0
+        self.layer_id = AscendMLAImpl._layer_id_counter
+        AscendMLAImpl._layer_id_counter += 1
+
+        # Load dump config once per process
+        if not hasattr(AscendMLAImpl, "_dump_cfg"):
+            AscendMLAImpl._dump_cfg = self._load_dump_cfg()
+
+    @classmethod
+    def _load_dump_cfg(cls) -> dict:
+        # File-based control to avoid relying on envs in worker
+        # Path is fixed to debug/dump_config.json
+        cfg_path = os.path.join("debug", "dump_config.json")
+        try:
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r") as f:
+                    cfg = json.load(f)
+                # sanitize
+                if not isinstance(cfg, dict):
+                    return {}
+                return cfg
+        except Exception:
+            pass
+        return {}
+
+    def _dump_enabled(self) -> bool:
+        cfg = getattr(AscendMLAImpl, "_dump_cfg", {})
+        if not cfg or not cfg.get("enabled", False):
+            return False
+        layers = cfg.get("layers")
+        if isinstance(layers, list) and len(layers) > 0:
+            try:
+                if self.layer_id not in [int(x) for x in layers]:
+                    return False
+            except Exception:
+                pass
+        cp_ranks = cfg.get("cp_ranks")
+        if isinstance(cp_ranks, list) and len(cp_ranks) > 0:
+            try:
+                if self.cp_rank not in [int(x) for x in cp_ranks]:
+                    return False
+            except Exception:
+                pass
+        return True
+
+    def _dump_dir(self) -> str:
+        cfg = getattr(AscendMLAImpl, "_dump_cfg", {})
+        return cfg.get("dir", os.path.join("debug", "compare"))
+
+    def _dump_kv_blocks(self) -> int:
+        cfg = getattr(AscendMLAImpl, "_dump_cfg", {})
+        try:
+            return int(cfg.get("kv_blocks", 8))
+        except Exception:
+            return 8
+
+    def _maybe_dump_pickle(self, tag: str, payload: dict) -> None:
+        if not self._dump_enabled():
+            return
+        dump_dir = self._dump_dir()
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+        except Exception:
+            pass
+        ts = time.time_ns()
+        fname = f"{dump_dir}/layer{self.layer_id}_cp{self.cp_rank}_sp{get_tensor_model_parallel_rank() if self.sp_group else 0}_{tag}_{ts}.pkl"
+        try:
+            with open(fname, "wb") as f:
+                pickle.dump(payload, f)
+        except Exception:
+            pass
 
     def _v_up_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
@@ -1329,6 +1407,24 @@ class AscendMLAImpl(MLAAttentionImpl):
                     key_cache=kv_cache[0],
                     value_cache=kv_cache[1],
                     slot_indices=attn_metadata.slot_mapping)
+                # Debug dump KV cache raw blocks (small prefix) on cp_rank 0
+                if self._dump_enabled() and self.cp_rank == 0:
+                    try:
+                        max_blocks_dump = self._dump_kv_blocks()
+                        kv0 = kv_cache[0][:max_blocks_dump].detach().cpu().to(torch.float32)
+                        kv1 = kv_cache[1][:max_blocks_dump].detach().cpu().to(torch.float32)
+                        self._maybe_dump_pickle(
+                            tag="kv_prefill",
+                            payload={
+                                "layer_id": self.layer_id,
+                                "cp_rank": int(self.cp_rank),
+                                "kv_nope_blocks": kv0.numpy(),
+                                "kv_rope_blocks": kv1.numpy(),
+                                "block_size": int(kv_cache[0].shape[1]) if len(kv_cache[0].shape) > 1 else None,
+                            },
+                        )
+                    except Exception:
+                        pass
             else:
                 prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(
                     prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
@@ -1583,6 +1679,28 @@ class AscendMLAImpl(MLAAttentionImpl):
                     prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
                     prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
                     prefill_preprocess_res.value, kv_cache, attn_metadata)
+            # Debug: dump prefill attention output (gather across CP)
+            if self._dump_enabled():
+                try:
+                    out_local = output_prefill.detach()
+                    # Gather across CP group to assemble (may be duplicated but acceptable for compare)
+                    if self.cp_size > 1:
+                        out_list = [torch.empty_like(out_local) for _ in range(self.cp_size)]
+                        dist.all_gather(out_list, out_local, group=self.cp_group)
+                        out_g = torch.cat(out_list, dim=0)
+                    else:
+                        out_g = out_local
+                    self._maybe_dump_pickle(
+                        tag="attn_prefill_out",
+                        payload={
+                            "layer_id": self.layer_id,
+                            "cp_rank": int(self.cp_rank),
+                            "out_shape": tuple(out_g.shape),
+                            "out_fp32_head": out_g[: min(128, out_g.shape[0])].to(torch.float32).cpu().numpy(),
+                        },
+                    )
+                except Exception:
+                    pass
             current_ms_metadata = get_multistream_comm_context()
             if current_ms_metadata is not None:
                 with torch.npu.stream(current_ms_metadata.comm_stream):
