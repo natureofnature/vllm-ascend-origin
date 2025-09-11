@@ -608,9 +608,18 @@ class AscendMLAImpl(MLAAttentionImpl):
     def _dump_kv_blocks(self) -> int:
         cfg = getattr(AscendMLAImpl, "_dump_cfg", {})
         try:
-            return int(cfg.get("kv_blocks", 8))
+            # 0 或未配置表示全部块
+            return int(cfg.get("kv_blocks", 0))
         except Exception:
-            return 8
+            return 0
+
+    def _dump_out_tokens(self) -> int:
+        cfg = getattr(AscendMLAImpl, "_dump_cfg", {})
+        try:
+            # 0 或未配置表示全部 token
+            return int(cfg.get("out_tokens", 0))
+        except Exception:
+            return 0
 
     def _maybe_dump_pickle(self, tag: str, payload: dict) -> None:
         if not self._dump_enabled():
@@ -1679,24 +1688,22 @@ class AscendMLAImpl(MLAAttentionImpl):
                     prefill_preprocess_res.q_nope, prefill_preprocess_res.q_pe,
                     prefill_preprocess_res.k_nope, prefill_preprocess_res.k_pe,
                     prefill_preprocess_res.value, kv_cache, attn_metadata)
-            # Debug: dump prefill attention output (gather across CP)
+            # Debug: dump prefill attention output (local-only, no collective)
             if self._dump_enabled():
                 try:
                     out_local = output_prefill.detach()
-                    # Gather across CP group to assemble (may be duplicated but acceptable for compare)
-                    if self.cp_size > 1:
-                        out_list = [torch.empty_like(out_local) for _ in range(self.cp_size)]
-                        dist.all_gather(out_list, out_local, group=self.cp_group)
-                        out_g = torch.cat(out_list, dim=0)
-                    else:
+                    n_conf = self._dump_out_tokens()
+                    if n_conf is None or n_conf <= 0:
                         out_g = out_local
+                    else:
+                        out_g = out_local[: min(out_local.shape[0], n_conf)]
                     self._maybe_dump_pickle(
                         tag="attn_prefill_out",
                         payload={
                             "layer_id": self.layer_id,
                             "cp_rank": int(self.cp_rank),
                             "out_shape": tuple(out_g.shape),
-                            "out_fp32_head": out_g[: min(128, out_g.shape[0])].to(torch.float32).cpu().numpy(),
+                            "out_fp32_head": out_g.to(torch.float32).cpu().numpy(),
                         },
                     )
                 except Exception:
