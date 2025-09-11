@@ -1431,11 +1431,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                     try:
                         max_blocks_dump = self._dump_kv_blocks()
                         if max_blocks_dump and max_blocks_dump > 0:
-                            kv0 = kv_cache[0][:max_blocks_dump].detach().cpu().to(torch.float32)
-                            kv1 = kv_cache[1][:max_blocks_dump].detach().cpu().to(torch.float32)
+                            kv0 = kv_cache[0][:max_blocks_dump].detach().cpu()#.to(torch.float32)
+                            kv1 = kv_cache[1][:max_blocks_dump].detach().cpu()#.to(torch.float32)
                         else:
-                            kv0 = kv_cache[0].detach().cpu().to(torch.float32)
-                            kv1 = kv_cache[1].detach().cpu().to(torch.float32)
+                            logger.info("[dump info], kv_c_normed shape:{kv_c_normed.shape}, k_pe shape:{k_pe.shape}")
+                            kv0 = kv_c_normed[0].detach().cpu()#.to(torch.float32)
+                            kv1 = k_pe[1].detach().cpu()#.to(torch.float32)
                         self._maybe_dump_pickle(
                             tag="kv_prefill",
                             payload={
