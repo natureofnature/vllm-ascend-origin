@@ -637,6 +637,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         try:
             with open(fname, "wb") as f:
                 pickle.dump(payload, f)
+            try:
+                from vllm.logger import logger as _vlog
+                _vlog.info(f"[DUMP] wrote {fname}")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -1422,7 +1427,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     value_cache=kv_cache[1],
                     slot_indices=attn_metadata.slot_mapping)
                 # Debug dump KV cache raw blocks (small prefix) on cp_rank 0
-                if self._dump_enabled() and self.cp_rank == 0:
+                if self._dump_enabled():
                     try:
                         max_blocks_dump = self._dump_kv_blocks()
                         if max_blocks_dump and max_blocks_dump > 0:
