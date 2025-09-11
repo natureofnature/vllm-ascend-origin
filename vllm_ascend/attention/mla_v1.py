@@ -1706,6 +1706,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     prefill_preprocess_res.value, kv_cache, attn_metadata)
             # Debug: dump prefill attention output (local-only, no collective)
             if self._dump_enabled():
+                _dump_step = self._prefill_step_idx
                 try:
                     out_local = output_prefill.detach()
                     n_conf = self._dump_out_tokens()
