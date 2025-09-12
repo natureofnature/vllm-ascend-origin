@@ -1431,8 +1431,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     try:
                         max_blocks_dump = self._dump_kv_blocks()
                         if max_blocks_dump and max_blocks_dump > 0:
-                            kv0 = kv_cache[0][:max_blocks_dump].detach().cpu()#.to(torch.float32)
-                            kv1 = kv_cache[1][:max_blocks_dump].detach().cpu()#.to(torch.float32)
+                            kv0 = kv_cache[0][:max_blocks_dump].detach().cpu().to(torch.float32)
+                            kv1 = kv_cache[1][:max_blocks_dump].detach().cpu().to(torch.float32)
                         else:
                             logger.info(f"[dump info], kv_c_normed shape:{kv_c_normed.shape}, k_pe shape:{k_pe.shape}")
                             kv0 = kv_c_normed.detach().cpu().to(torch.float32)
@@ -1453,6 +1453,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             else:
                 prefill_k_pe, prefill_k_c_normed = self.exec_kv_prefill(
                     prefill_kv_no_split, cos, sin, kv_cache, prefill_slots)
+
             prefill_k_nope, prefill_value = self.kv_b_proj(
                     prefill_k_c_normed)[0].view(
                     -1, self.num_heads, 
@@ -1462,6 +1463,30 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prefill_k_pe = prefill_k_pe.view(prefill_q_c.shape[0],
                                                 self.num_kv_heads, -1)
             prefill_k_pe = prefill_k_pe.expand((*prefill_k_nope.shape[:-1], -1))
+            # Debug dump KV cache raw blocks (small prefix) on cp_rank 0
+            if self._dump_enabled():
+                try:
+                    prefill_q_nope_0 = prefill_q_nope.detach().cpu().to(torch.float32)
+                    prefill_q_pe_0 = prefill_q_pe.detach().cpu().to(torch.float32)
+                    prefill_k_nope_0= prefill_k_nope.detach().cpu().to(torch.float32)
+                    prefill_k_pe_0= prefill_k_pe.detach().cpu().to(torch.float32)
+                    prefill_value_0= prefill_value.detach().cpu().to(torch.float32)
+                    self._maybe_dump_pickle(
+                        tag="kv_prefill_post",
+                        payload={
+                            "layer_id": self.layer_id,
+                            "cp_rank": int(self.cp_rank),
+                            "prefill_q_nope": prefill_q_nope_0.numpy(),
+                            "prefill_q_pe": prefill_q_pe_0.numpy(),
+                            "prefill_k_nope": prefill_k_nope_0.numpy(),
+                            "prefill_k_pe": prefill_k_pe_0.numpy(),
+                            "prefill_value": prefill_value_0.numpy(),
+                        },
+                        step=_dump_step,
+                    )
+                except Exception:
+                    pass
+            
             prefill_preprocess_res = PrefillMLAPreprocessResult(
                 prefill_q_nope, prefill_q_pe, prefill_k_nope, prefill_k_pe,
                 prefill_value)
