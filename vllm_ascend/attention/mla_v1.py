@@ -848,14 +848,17 @@ class AscendMLAImpl(MLAAttentionImpl):
                         lse = torch.where(lse_mask, lse, lse_wo)
                     return out, lse
 
+                logger.info("--->here")
                 block_lse_local_bt = block_lse_local.permute(1, 0).unsqueeze(-1)
                 out_lse_local = torch.cat([block_out_local, block_lse_local_bt], dim=-1)
                 out_lse_list = [torch.empty_like(out_lse_local) for _ in range(self.cp_size)]
                 dist.all_gather(out_lse_list, out_lse_local, group=self.cp_group)
+                logger.info("--->here")
 
                 tmp_seq_len2 = seq_len2.to(q_nope.device)
                 seq_len2_list = [torch.empty_like(tmp_seq_len2) for _ in range(self.cp_size)]
                 dist.all_gather(seq_len2_list, tmp_seq_len2.to(torch.int32), group=self.cp_group)
+                logger.info("--->here")
                 chunk_out_g = None
                 chunk_lse_g = None
                 for r in range(self.cp_size):
