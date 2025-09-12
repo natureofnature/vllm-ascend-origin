@@ -910,6 +910,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                   dtype=q_nope.dtype,
                                   device=q_nope.device)
         if attn_metadata.attn_state == AscendAttentionState.PrefillNoCache:
+            logger.info("==============> here, PrefillNoCache")
             query = torch.cat((q_nope, q_pe), dim=-1)
             key = torch.cat((k_nope, k_pe), dim=-1)
             torch_npu._npu_flash_attention(
@@ -923,6 +924,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 num_kv_heads=self.num_heads,
                 out=attn_output)
         elif self.chunked_prefill_for_mla:
+            logger.info("==============> here, chunked_prefill_for_mla")
             attn_lse = torch.empty(self.num_heads,
                                    num_tokens,
                                    dtype=torch.float32,
@@ -937,6 +939,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             if attn_metadata.num_prefills > 1:
                 self.prefill_mask = self.prefill_mask.unsqueeze(0).repeat(
                     attn_metadata.num_prefills, 1, 1)
+                logger.info("==============> here, num_prefills > 1")
             torch_npu.atb.npu_ring_mla(
                 q_nope=q_nope,
                 q_rope=q_pe,
@@ -960,6 +963,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             attn_output, attn_lse = self._compute_prefill_context( \
                 q_nope, q_pe, kv_c_and_k_pe_cache, self.qk_rope_head_dim, attn_metadata, attn_output, attn_lse)
         else:
+            logger.info("==============> here, else vanilla")
             query = torch.cat((q_nope, q_pe), dim=-1)
             attn_output_torch = torch.empty(num_tokens,
                                             self.num_heads * self.v_head_dim,
