@@ -1475,7 +1475,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             decode_token_per_req=self.decode_token_per_req,
             common_long_seq_metadata=long_seq_metadata
         )
-        logger.info(f"======> attentin metadata==> positions: {self.positions}, query_start_loc:{self.query_start_loc[:num_reqs + 1]}, query_start_loc_cpu:{self.query_start_loc_cpu[:num_reqs + 1]},"
+        logger.info(f"======> attentin metadata==> positions: {self.positions.tolist()}, query_start_loc:{self.query_start_loc[:num_reqs + 1]}, query_start_loc_cpu:{self.query_start_loc_cpu[:num_reqs + 1]},"
                     f"seq_lens_cpu:{self.seq_lens_cpu}, num_actual_tokens:{total_num_scheduled_tokens}, actual_seq_lengths_q:{self.actual_seq_lengths_q}"
                     )
         attn_metadata = self.attn_metadata_builder.build(
