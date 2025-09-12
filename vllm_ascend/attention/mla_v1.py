@@ -860,12 +860,18 @@ class AscendMLAImpl(MLAAttentionImpl):
                 chunk_out_g = None
                 chunk_lse_g = None
                 for r in range(self.cp_size):
+                    logger.info("--->here")
                     out_lse_r = out_lse_list[r]
+                    logger.info("--->here")
                     out_r, lse_r = torch.split(out_lse_r, [self.v_head_dim, 1], dim=-1)
+                    logger.info("--->here")
                     mask_req = (seq_len2_list[r].to(q_nope.device) > 0)
+                    logger.info("--->here")
                     token_mask = mask_req[req_ids]
+                    logger.info("--->here")
                     chunk_out_g, chunk_lse_g = _update_out_and_lse(
                         chunk_out_g, chunk_lse_g, out_r, lse_r, token_mask)
+                    logger.info("--->here")
                 if chunk_out_g is not None:
                     prefix_output, prefix_lse = _update_out_and_lse(
                         prefix_output, prefix_lse, chunk_out_g, chunk_lse_g)
