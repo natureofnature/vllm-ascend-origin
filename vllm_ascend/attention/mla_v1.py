@@ -1058,7 +1058,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             f"out_head.shape={output_head.shape} out_tail.shape={output_tail.shape} out_concat.shape={output.shape} "
             f"lse_head.shape={head_lse.shape} lse_tail.shape={tail_lse.shape}")
 
-        logger.info(f"----> prefill:{attn_metadata.prefill}, chunked_context:{attn_metadata.prefill.chunked_context}")
+        #logger.info(f"----> prefill:{attn_metadata.prefill}, chunked_context:{attn_metadata.prefill.chunked_context}")
 
         # 后处理过程，先保持 [tokens, H, V] 形状，必要时执行 chunked 上下文累加
         if attn_metadata.prefill is not None and \
