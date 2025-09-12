@@ -765,6 +765,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     torch.ones(512, 512, device=q_nope.device, dtype=q_nope.dtype), 1)
                 self.prefill_mask = mask_local
 
+        logger.info(f"||||||====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
+
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
 
