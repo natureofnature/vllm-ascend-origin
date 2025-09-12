@@ -1278,7 +1278,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # so set seq_lens to current-step scheduled lengths to avoid inflating to
         # (computed + query). Keep original cumulative behavior for other cases.
         if self.cp_size > 1 and is_prefill:
-            self.seq_lens_np[:num_reqs] = num_scheduled_tokens
+            self.seq_lens_np[:num_reqs] = self.input_batch.num_computed_tokens_cpu[:num_reqs]
+            logger.info(f"===> seq_lens_np:{self.seq_lens_np[:num_reqs]}")
         else:
             self.seq_lens_np[:num_reqs] = (
                 self.input_batch.num_computed_tokens_cpu[:num_reqs] +
