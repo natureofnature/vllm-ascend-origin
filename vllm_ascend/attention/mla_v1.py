@@ -364,7 +364,10 @@ class AscendMLAMetadataBuilder:
             context_lens_cpu = num_computed_tokens_cpu[reqs_start:num_reqs]
             max_context_len_cpu = context_lens_cpu.max().item()
             num_prefills_with_context_cpu = (context_lens_cpu > 0).sum().item()
-            logger.info(f"--->seq_lens:{seq_lens}, query_lens:{query_lens}, num_computed_tokens_cpu:{num_computed_tokens_cpu}, reqs_start:{reqs_start}, num_reqs:{num_reqs}, chunked prefill enabled:{self.chunked_prefill_enabled}, max_context_len_cpu:{max_context_len_cpu}")
+            logger.info(f"--->seq_lens:{seq_lens}, query_lens:{query_lens}, num_computed_tokens_cpu:{num_computed_tokens_cpu}, reqs_start:{reqs_start}, num_reqs:{num_reqs}, "
+                        f"chunked prefill enabled:{self.chunked_prefill_enabled}, max_context_len_cpu:{max_context_len_cpu}",
+                        f"q_head_"
+                        )
             if self.chunked_prefill_enabled and max_context_len_cpu > 0:
                 max_context_chunk = (self.chunked_prefill_workspace_size //
                                      num_prefills_with_context_cpu)
@@ -850,8 +853,10 @@ class AscendMLAImpl(MLAAttentionImpl):
                 out_lse_local = torch.cat([block_out_local, block_lse_local_bt], dim=-1)
                 out_lse_list = [torch.empty_like(out_lse_local) for _ in range(self.cp_size)]
                 dist.all_gather(out_lse_list, out_lse_local, group=self.cp_group)
-                seq_len2_list = [torch.empty_like(seq_len2) for _ in range(self.cp_size)]
-                dist.all_gather(seq_len2_list, seq_len2.to(torch.int32), group=self.cp_group)
+
+                tmp_seq_len2 = seq_len2.to(q_nope.device)
+                seq_len2_list = [torch.empty_like(tmp_seq_len2) for _ in range(self.cp_size)]
+                dist.all_gather(seq_len2_list, tmp_seq_len2.to(torch.int32), group=self.cp_group)
                 chunk_out_g = None
                 chunk_lse_g = None
                 for r in range(self.cp_size):
