@@ -364,7 +364,7 @@ class AscendMLAMetadataBuilder:
             context_lens_cpu = num_computed_tokens_cpu[reqs_start:num_reqs]
             max_context_len_cpu = context_lens_cpu.max().item()
             num_prefills_with_context_cpu = (context_lens_cpu > 0).sum().item()
-            logger.info(f"---> chunked prefill enabled:{self.chunked_prefill_enabled}, max_context_len_cpu:{max_context_len_cpu}")
+            logger.info(f"--->seq_lens:{seq_lens}, query_lens:{query_lens}, num_computed_tokens_cpu:{num_computed_tokens_cpu}, reqs_start{reqs_start}, num_reqs:{num_reqs}, chunked prefill enabled:{self.chunked_prefill_enabled}, max_context_len_cpu:{max_context_len_cpu}")
             if self.chunked_prefill_enabled and max_context_len_cpu > 0:
                 max_context_chunk = (self.chunked_prefill_workspace_size //
                                      num_prefills_with_context_cpu)
