@@ -1284,8 +1284,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.seq_lens_np[:num_reqs] = (
                 self.input_batch.num_computed_tokens_cpu[:num_reqs] +
                 num_scheduled_tokens)
-        seq_lens_cpu = self.seq_lens_cpu[:num_reqs]
-        seq_lens = self.seq_lens_cpu[:num_reqs]
+        seq_lens_cpu = num_scheduled_tokens[:num_reqs] #self.seq_lens_cpu[:num_reqs]
+        seq_lens = num_scheduled_tokens[:num_reqs] #self.seq_lens_cpu[:num_reqs]
         logger.info(
             f"=====> [MR-PREFILL] cp={self.cp_size} sp={self.sp_size} num_reqs={num_reqs} "
             f"query_lens.shape={self.query_lens.shape} seq_lens.shape={seq_lens.shape}")
