@@ -742,7 +742,6 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         iters = len(prefill_metadata.chunked_context.seq_tot)
 
-        seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32, device=q_nope.device).contiguous()
         cache_kv_c = kv_c_and_k_pe_cache[0]
         cache_k_pe = kv_c_and_k_pe_cache[1]
         num_heads = cache_k_pe.size(2)
@@ -773,8 +772,11 @@ class AscendMLAImpl(MLAAttentionImpl):
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
 
-            seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i].to(q_nope.device, dtype=torch.int32).contiguous()
+            seq_len1 = seq_len1.to(torch.int32).to(q_nope.device)
+            seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i].to(torch.int32).to(q_nope.device)
+            logger.info(f"--->here, seq_len1:{seq_len1}, seq_len2:{seq_len2}")
             seq_len = torch.stack([seq_len1, seq_len2])
+            logger.info(f"\n--->here, seq_len:{seq_len}\n")
             kv_c_normed = torch.empty(toks,
                                       num_heads,
                                       latent_kv_dim,
@@ -785,6 +787,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                rope_dim,
                                dtype=q_nope.dtype,
                                device=q_nope.device)
+            logger.info("--->here")
 
             torch_npu.atb.npu_paged_cache_load(
                 cache_kv_c,
@@ -795,12 +798,14 @@ class AscendMLAImpl(MLAAttentionImpl):
                 key=kv_c_normed,
                 value=k_pe,
             )
+            logger.info("--->here")
 
             kv_c_normed = kv_c_normed.squeeze()
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
             k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
+            logger.info("--->here")
             if self.cp_size > 1:
                 # 先计算本 rank 对该 chunk 的贡献
                 block_out_local = torch.empty(
@@ -809,13 +814,16 @@ class AscendMLAImpl(MLAAttentionImpl):
                 block_lse_local = torch.empty(
                     self.num_heads, num_tokens_all,
                     dtype=torch.float32, device=q_nope.device)
+                logger.info(f"--->here, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
+                            f"value:{v.shape}, mask:{mask_local.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
+                            f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
                 torch_npu.atb.npu_ring_mla(
                     q_nope=q_nope,
                     q_rope=q_pe,
                     k_nope=k_nope,
                     k_rope=k_pe,
                     value=v,
-                    mask=None,
+                    mask=mask_local,
                     seqlen=seq_len,
                     head_num=self.num_heads,
                     kv_head_num=self.num_heads,
