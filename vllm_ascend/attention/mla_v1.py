@@ -760,14 +760,15 @@ class AscendMLAImpl(MLAAttentionImpl):
         if attn_metadata is not None and attn_metadata.prefill is not None and \
                 attn_metadata.prefill.cp_prefill_mask is not None:
             mask_local = attn_metadata.prefill.cp_prefill_mask
+            logger.info(f"||||||====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
         else:
             mask_local = self.prefill_mask
             if mask_local is None:
                 mask_local = torch.triu(
                     torch.ones(512, 512, device=q_nope.device, dtype=q_nope.dtype), 1)
                 self.prefill_mask = mask_local
+            logger.info(f"+++++++====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
 
-        logger.info(f"||||||====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
