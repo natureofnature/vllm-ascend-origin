@@ -881,6 +881,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                         chunk_out_g, chunk_lse_g, out_r, lse_r, token_mask)
                     logger.info(f"--->here, chunk shape:{chunk_out_g.shape},{chunk_lse_g.shape}")
                 if chunk_out_g is not None:
+                    prefix_lse = prefix_lse.permute(1, 0).unsqueeze(-1)
                     prefix_output, prefix_lse = _update_out_and_lse(
                         prefix_output, prefix_lse, chunk_out_g, chunk_lse_g)
                 logger.info(
