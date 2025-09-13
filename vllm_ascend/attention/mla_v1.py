@@ -748,7 +748,9 @@ class AscendMLAImpl(MLAAttentionImpl):
         latent_kv_dim = kv_c_and_k_pe_cache[0].size(-1)
         # token -> request mapping for building per-token masks when CP>1
         num_tokens_all = q_nope.size(0)
-        seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32)
+        seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32, device=q_nope.device).contiguous()
+        # normalize prefix LSE to [bs, heads, 1] for stable updates
+        prefix_lse_bt = prefix_lse.permute(1, 0).unsqueeze(-1).contiguous() if prefix_lse is not None else None
         if self.cp_size > 1:
             req_ids = torch.repeat_interleave(
                 torch.arange(seq_len1.numel(), device=q_nope.device, dtype=torch.long),
@@ -773,11 +775,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
 
-            seq_len1 = seq_len1.to(torch.int32).to(q_nope.device)
-            seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i].to(torch.int32).to(q_nope.device)
-            logger.info(f"--->here, seq_len1:{seq_len1}, seq_len2:{seq_len2}")
+            seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i].to(q_nope.device, dtype=torch.int32).contiguous()
             seq_len = torch.stack([seq_len1.cpu(), seq_len2.cpu()])
-            logger.info(f"\n--->here, seq_len:{seq_len}\n")
             kv_c_normed = torch.empty(toks,
                                       num_heads,
                                       latent_kv_dim,
@@ -816,20 +815,20 @@ class AscendMLAImpl(MLAAttentionImpl):
                     self.num_heads, num_tokens_all,
                     dtype=torch.float32, device=q_nope.device)
                 logger.info(f"--->here, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
-                            f"value:{v.shape}, mask:{mask_local.shape},seq_len:{seq_len.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
-                            f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}, seq_len:{seq_len}")
+                            f"value:{v.shape}, seq_len:{seq_len.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
+                            f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
                 torch_npu.atb.npu_ring_mla(
                     q_nope=q_nope,
                     q_rope=q_pe,
                     k_nope=k_nope,
                     k_rope=k_pe,
                     value=v,
-                    mask=mask_local,
+                    mask=None,
                     seqlen=seq_len,
                     head_num=self.num_heads,
                     kv_head_num=self.num_heads,
-                    pre_out=block_out_local,
-                    prev_lse=block_lse_local,
+                    pre_out=None,
+                    prev_lse=None,
                     qk_scale=self.scale,
                     kernel_type="kernel_type_high_precision",
                     mask_type="no_mask",
@@ -881,13 +880,23 @@ class AscendMLAImpl(MLAAttentionImpl):
                         chunk_out_g, chunk_lse_g, out_r, lse_r, token_mask)
                     logger.info(f"--->here, chunk shape:{chunk_out_g.shape},{chunk_lse_g.shape}")
                 if chunk_out_g is not None:
-                    prefix_lse = prefix_lse.permute(1, 0).unsqueeze(-1)
-                    prefix_output, prefix_lse = _update_out_and_lse(
-                        prefix_output, prefix_lse, chunk_out_g, chunk_lse_g)
+                    if prefix_lse_bt is None:
+                        prefix_output = chunk_out_g.to(torch.float32)
+                        prefix_lse_bt = chunk_lse_g
+                    else:
+                        prefix_output, prefix_lse_bt = _update_out_and_lse(
+                            prefix_output, prefix_lse_bt, chunk_out_g, chunk_lse_g)
                 logger.info(
                     f"#####> [MLA-CTX-CP] it={i} toks={toks} q_nope.shape={q_nope.shape} k_nope.shape={k_nope.shape} "
                     f"v.shape={v.shape} out_local.shape={block_out_local.shape} lse_local.shape={block_lse_local.shape}")
             else:
+                # compute this chunk block then update prefix tensors to keep shapes consistent
+                block_out_local2 = torch.empty(
+                    num_tokens_all, self.num_heads, self.v_head_dim,
+                    dtype=q_nope.dtype, device=q_nope.device)
+                block_lse_local2 = torch.empty(
+                    self.num_heads, num_tokens_all,
+                    dtype=torch.float32, device=q_nope.device)
                 torch_npu.atb.npu_ring_mla(
                     q_nope=q_nope,
                     q_rope=q_pe,
@@ -898,18 +907,28 @@ class AscendMLAImpl(MLAAttentionImpl):
                     seqlen=seq_len,
                     head_num=self.num_heads,
                     kv_head_num=self.num_heads,
-                    pre_out=prefix_output,
-                    prev_lse=prefix_lse,
+                    pre_out=None,
+                    prev_lse=None,
                     qk_scale=self.scale,
                     kernel_type="kernel_type_high_precision",
                     mask_type="no_mask",
                     input_layout="type_bsnd",
                     calc_type="calc_type_default",
-                    output=prefix_output,
-                    softmax_lse=prefix_lse)
+                    output=block_out_local2,
+                    softmax_lse=block_lse_local2)
+                block_lse_local_bt2 = block_lse_local2.permute(1, 0).unsqueeze(-1)
+                if prefix_lse_bt is None:
+                    prefix_output = block_out_local2.to(torch.float32)
+                    prefix_lse_bt = block_lse_local_bt2
+                else:
+                    prefix_output, prefix_lse_bt = _update_out_and_lse(
+                        prefix_output, prefix_lse_bt, block_out_local2, block_lse_local_bt2)
                 logger.info(
                     f"#####> [MLA-CTX] it={i} toks={toks} q_nope.shape={q_nope.shape} k_nope.shape={k_nope.shape} v.shape={v.shape} "
-                    f"prefix_out.shape={prefix_output.shape} prefix_lse.shape={prefix_lse.shape}")
+                    f"prefix_out.shape={prefix_output.shape} prefix_lse.shape={prefix_lse_bt.shape}")
+        # convert lse back to [heads, bs]
+        if prefix_lse_bt is not None:
+            prefix_lse = prefix_lse_bt.squeeze(-1).permute(1, 0).contiguous()
         return prefix_output, prefix_lse
 
     def _forward_prefill(
