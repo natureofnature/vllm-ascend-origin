@@ -776,7 +776,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             seq_len1 = seq_len1.to(torch.int32).to(q_nope.device)
             seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i].to(torch.int32).to(q_nope.device)
             logger.info(f"--->here, seq_len1:{seq_len1}, seq_len2:{seq_len2}")
-            seq_len = torch.stack([seq_len1, seq_len2])
+            seq_len = torch.stack([seq_len1.cpu(), seq_len2.cpu()])
             logger.info(f"\n--->here, seq_len:{seq_len}\n")
             kv_c_normed = torch.empty(toks,
                                       num_heads,
@@ -816,8 +816,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     self.num_heads, num_tokens_all,
                     dtype=torch.float32, device=q_nope.device)
                 logger.info(f"--->here, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
-                            f"value:{v.shape}, mask:{mask_local.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
-                            f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
+                            f"value:{v.shape}, mask:{mask_local.shape},seq_len:{seq_len.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
+                            f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}, seq_len:{seq_len}")
                 torch_npu.atb.npu_ring_mla(
                     q_nope=q_nope,
                     q_rope=q_pe,
@@ -828,8 +828,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     seqlen=seq_len,
                     head_num=self.num_heads,
                     kv_head_num=self.num_heads,
-                    pre_out=None,
-                    prev_lse=None,
+                    pre_out=block_out_local,
+                    prev_lse=block_lse_local,
                     qk_scale=self.scale,
                     kernel_type="kernel_type_high_precision",
                     mask_type="no_mask",
@@ -851,8 +851,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                         block_out = block_out.to(torch.float32)
                         out_wo = out.clone()
                         lse_wo = lse.clone()
-                        out = out - torch.sigmoid(block_lse - lse) * (out - block_out)
-                        lse = lse - torch.logsigmoid(lse - block_lse)
+                        logger.info(f"---->here, out shape:{out.shape}, lse shape:{lse.shape}, block_out:{block_out.shape}, block lse:{block_lse.shape}")
+                        out = out - F.sigmoid(block_lse - lse) * (out - block_out)
+                        lse = lse - F.logsigmoid(lse - block_lse)
                         out = torch.where(out_mask, out, out_wo)
                         lse = torch.where(lse_mask, lse, lse_wo)
                     return out, lse
@@ -871,14 +872,14 @@ class AscendMLAImpl(MLAAttentionImpl):
                     out_lse_r = out_lse_list[r]
                     logger.info("--->here")
                     out_r, lse_r = torch.split(out_lse_r, [self.v_head_dim, 1], dim=-1)
-                    logger.info("--->here")
+                    logger.info(f"--->here, out_r shape:{out_r.shape}, lse_r.shape:{lse_r.shape}")
                     mask_req = (seq_len2_list[r].to(q_nope.device) > 0)
                     logger.info("--->here")
                     token_mask = mask_req[req_ids]
                     logger.info("--->here")
                     chunk_out_g, chunk_lse_g = _update_out_and_lse(
                         chunk_out_g, chunk_lse_g, out_r, lse_r, token_mask)
-                    logger.info("--->here")
+                    logger.info(f"--->here, chunk shape:{chunk_out_g.shape},{chunk_lse_g.shape}")
                 if chunk_out_g is not None:
                     prefix_output, prefix_lse = _update_out_and_lse(
                         prefix_output, prefix_lse, chunk_out_g, chunk_lse_g)
@@ -1160,7 +1161,8 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         logger.info(f"-->mask_no_mask, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
                     f"value:{value_nomask.shape}, mask:{mask.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
-                    f"qk_scale:{self.scale},out:{attn_output.shape}, softmax_lse:{attn_lse.shape}")
+                    f"qk_scale:{self.scale},out:{attn_output.shape}, softmax_lse:{attn_lse.shape}, seq_len:{attn_nomask_seqlens},"
+                    f"prout shape:{attn_output.shape}, prev_lse shape:{attn_lse.shape} ")
         torch_npu.atb.npu_ring_mla(
             q_nope=q_nope,
             q_rope=q_pe,
