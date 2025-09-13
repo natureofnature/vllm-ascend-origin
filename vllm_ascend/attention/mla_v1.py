@@ -742,7 +742,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         iters = len(prefill_metadata.chunked_context.seq_tot)
 
-        seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32)
+        seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32, device=q_nope.device).contiguous()
         cache_kv_c = kv_c_and_k_pe_cache[0]
         cache_k_pe = kv_c_and_k_pe_cache[1]
         num_heads = cache_k_pe.size(2)
@@ -773,7 +773,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
 
-            seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i]
+            seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i].to(q_nope.device, dtype=torch.int32).contiguous()
             seq_len = torch.stack([seq_len1, seq_len2])
             kv_c_normed = torch.empty(toks,
                                       num_heads,
@@ -815,7 +815,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     k_nope=k_nope,
                     k_rope=k_pe,
                     value=v,
-                    mask=mask_local,
+                    mask=None,
                     seqlen=seq_len,
                     head_num=self.num_heads,
                     kv_head_num=self.num_heads,
@@ -853,12 +853,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 out_lse_local = torch.cat([block_out_local, block_lse_local_bt], dim=-1)
                 out_lse_list = [torch.empty_like(out_lse_local) for _ in range(self.cp_size)]
                 dist.all_gather(out_lse_list, out_lse_local, group=self.cp_group)
-                logger.info("--->here")
-
-                tmp_seq_len2 = seq_len2.to(q_nope.device)
-                seq_len2_list = [torch.empty_like(tmp_seq_len2) for _ in range(self.cp_size)]
-                dist.all_gather(seq_len2_list, tmp_seq_len2.to(torch.int32), group=self.cp_group)
-                logger.info("--->here")
+                seq_len2_list = [torch.empty_like(seq_len2) for _ in range(self.cp_size)]
+                dist.all_gather(seq_len2_list, seq_len2, group=self.cp_group)
                 chunk_out_g = None
                 chunk_lse_g = None
                 for r in range(self.cp_size):
@@ -887,7 +883,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     k_nope=k_nope,
                     k_rope=k_pe,
                     value=v,
-                    mask=mask_local,
+                    mask=None,
                     seqlen=seq_len,
                     head_num=self.num_heads,
                     kv_head_num=self.num_heads,
