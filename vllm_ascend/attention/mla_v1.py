@@ -1156,6 +1156,10 @@ class AscendMLAImpl(MLAAttentionImpl):
         k_nope_nomask = torch.index_select(k_nope, 0, kv_nomask_idx)
         value_nomask = torch.index_select(value, 0, kv_nomask_idx)
         k_pe_nomask = torch.index_select(k_pe, 0, kv_nomask_idx)
+
+        logger.info(f"-->mask_no_mask, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
+                    f"value:{value_nomask.shape}, mask:{mask.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
+                    f"qk_scale:{self.scale},out:{attn_output.shape}, softmax_lse:{attn_lse.shape}")
         torch_npu.atb.npu_ring_mla(
             q_nope=q_nope,
             q_rope=q_pe,
