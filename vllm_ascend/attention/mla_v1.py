@@ -568,6 +568,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             AscendMLAImpl._dump_cfg = self._load_dump_cfg()
         # Step index for chunked prefill dumps
         self._prefill_step_idx: int = 0
+        self._decode_step_idx: int = 0
 
     @classmethod
     def _load_dump_cfg(cls) -> dict:
@@ -751,6 +752,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32, device=q_nope.device).contiguous()
         # normalize prefix LSE to [bs, heads, 1] for stable updates
         prefix_lse_bt = prefix_lse.permute(1, 0).unsqueeze(-1).contiguous() if prefix_lse is not None else None
+        
         if self.cp_size > 1:
             req_ids = torch.repeat_interleave(
                 torch.arange(seq_len1.numel(), device=q_nope.device, dtype=torch.long),
@@ -775,60 +777,120 @@ class AscendMLAImpl(MLAAttentionImpl):
 
 
         for i in range(iters):
-            toks = prefill_metadata.chunked_context.seq_tot[i]
-
-            # Restrict KV to current CP-rank's slice within this chunk
-            seq_len2_cpu = prefill_metadata.chunked_context.chunk_seq_lens[i].to('cpu', dtype=torch.int32)
-            starts_cpu = prefill_metadata.chunked_context.starts[i].to('cpu', dtype=torch.int32)
-            lens_np = seq_len2_cpu.numpy()
-            base_np = lens_np // self.cp_size if self.cp_size > 0 else lens_np
-            rem_np = lens_np % self.cp_size if self.cp_size > 0 else 0
-            cp_rank = get_context_model_parallel_rank() if self.cp_size > 1 else 0
-            pre_np = base_np * cp_rank + np.minimum(rem_np, cp_rank)
-            cur_np = base_np + (rem_np > cp_rank).astype(np.int32)
-            starts_rank_np = starts_cpu.numpy() + pre_np
-
-            seq_len2_rank = torch.from_numpy(cur_np).to(q_nope.device, non_blocking=True)
-            starts_rank = torch.from_numpy(starts_rank_np).to(q_nope.device, non_blocking=True)
-            seq_len = torch.stack([seq_len1.cpu(), seq_len2_rank.cpu()])
-            kv_c_normed = torch.empty(toks,
-                                      num_heads,
-                                      latent_kv_dim,
-                                      dtype=q_nope.dtype,
-                                      device=q_nope.device)
-            k_pe = torch.empty(toks,
-                               num_heads,
-                               rope_dim,
-                               dtype=q_nope.dtype,
-                               device=q_nope.device)
-            logger.info(f"--->here, prefill context start location:{prefill_metadata.chunked_context.starts[i]}")
-
-            torch_npu.atb.npu_paged_cache_load(
-                cache_kv_c,
-                cache_k_pe,
-                prefill_metadata.block_table,
-                seq_len2_rank,
-                seq_starts=starts_rank,
-                key=kv_c_normed,
-                value=k_pe,
-            )
+            if self.cp_size * self.sp_size > 1:
+                # SP模式下：每个rank按request维度处理自己(cp,sp)对应的历史context切片
+                seq_len2_all = prefill_metadata.chunked_context.chunk_seq_lens[i]
+                num_requests = len(seq_len2_all)
+                
+                # 按请求分别计算每个rank应处理的token数
+                seq_len2_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
+                context_starts_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
+                total_toks = 0
+                
+                for req_idx in range(num_requests):
+                    req_context_len = seq_len2_all[req_idx].item()
+                    if req_context_len > 0:
+                        # 每个请求按CP×SP切分
+                        toks_per_rank = req_context_len // (self.cp_size * self.sp_size)
+                        rank_linear_id = self.cp_rank * self.sp_size + self.sp_rank
+                        start_offset = rank_linear_id * toks_per_rank
+                        rank_toks = min(toks_per_rank, max(0, req_context_len - start_offset))
+                        
+                        seq_len2_rank[req_idx] = rank_toks
+                        context_starts_rank[req_idx] = prefill_metadata.chunked_context.starts[i] + \
+                                                      sum(seq_len2_all[:req_idx].tolist()) + start_offset
+                        total_toks += rank_toks
+                
+                if total_toks > 0:
+                    kv_c_normed = torch.empty(total_toks,
+                                              num_heads,
+                                              latent_kv_dim,
+                                              dtype=q_nope.dtype,
+                                              device=q_nope.device)
+                    k_pe = torch.empty(total_toks,
+                                       num_heads,
+                                       rope_dim,
+                                       dtype=q_nope.dtype,
+                                       device=q_nope.device)
+                    
+                    torch_npu.atb.npu_paged_cache_load(
+                        cache_kv_c,
+                        cache_k_pe,
+                        prefill_metadata.block_table,
+                        seq_len2_rank.to(q_nope.device),
+                        seq_starts=prefill_metadata.chunked_context.starts[i],  #context_starts_rank.to(q_nope.device),
+                        key=kv_c_normed,
+                        value=k_pe,
+                    )
+                    seq_len2 = seq_len2_rank.to(q_nope.device)
+                else:
+                    # 如果当前rank没有token要处理，创建空tensor
+                    kv_c_normed = torch.empty(0, num_heads, latent_kv_dim,
+                                              dtype=q_nope.dtype, device=q_nope.device)
+                    k_pe = torch.empty(0, num_heads, rope_dim,
+                                       dtype=q_nope.dtype, device=q_nope.device)
+                    seq_len2 = torch.zeros((len(seq_len2_all),), dtype=torch.int32, device=q_nope.device)
+            else:
+                # 原有逻辑：CP-only模式
+                toks = prefill_metadata.chunked_context.seq_tot[i]
+                seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i].to(q_nope.device, dtype=torch.int32).contiguous()
+                kv_c_normed = torch.empty(toks,
+                                          num_heads,
+                                          latent_kv_dim,
+                                          dtype=q_nope.dtype,
+                                          device=q_nope.device)
+                k_pe = torch.empty(toks,
+                                   num_heads,
+                                   rope_dim,
+                                   dtype=q_nope.dtype,
+                                   device=q_nope.device)
+                
+                torch_npu.atb.npu_paged_cache_load(
+                    cache_kv_c,
+                    cache_k_pe,
+                    prefill_metadata.block_table,
+                    seq_len2,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                    key=kv_c_normed,
+                    value=k_pe,
+                )
+            
+            seq_len = torch.stack([seq_len1.cpu(), seq_len2.cpu()])
             logger.info("--->here")
 
             kv_c_normed = kv_c_normed.squeeze()
-            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
-            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
+            if self.sp_size > 1:
+                # SP模式下：先在SP组内all_gather，让每个CP组内的rank共享完整sequence块
+                # 步骤1: SP内all_gather潜表示
+                kv_c_k_pe_local = torch.cat([kv_c_normed, k_pe.squeeze()], dim=-1)  # [local_toks, latent_dim + rope_dim]
+                kv_c_k_pe_gather_list = [torch.empty_like(kv_c_k_pe_local) for _ in range(self.sp_size)]
+                dist.all_gather(kv_c_k_pe_gather_list, kv_c_k_pe_local, group=get_tp_group().device_group)
+                
+                # 步骤2: 在sequence维度拼接所有SP rank的数据
+                kv_c_k_pe_full = torch.cat(kv_c_k_pe_gather_list, dim=0)  # [total_sp_toks, latent_dim + rope_dim]
+                kv_c_normed_full, k_pe_full = torch.split(kv_c_k_pe_full, [latent_kv_dim, rope_dim], dim=-1)
+                
+                # 步骤3: 用TP投影处理完整序列，得到当前rank的head切片
+                kv_nope = self.kv_b_proj(kv_c_normed_full)[0].view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+                k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+                k_pe = k_pe_full.unsqueeze(1).expand((*k_nope.shape[:-1], -1))
+            else:
+                # 非SP模式：使用TP切分投影
+                kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+                k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+                k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
             logger.info("--->here")
-            if self.cp_size > 1:
-                # 先计算本 rank 对该 chunk 的贡献
+            if self.cp_size * self.sp_size > 1:
+                # CP+SP模式：先计算本 rank 对该 chunk 的贡献
                 block_out_local = torch.empty(
                     num_tokens_all, self.num_heads, self.v_head_dim,
                     dtype=q_nope.dtype, device=q_nope.device)
                 block_lse_local = torch.empty(
                     self.num_heads, num_tokens_all,
                     dtype=torch.float32, device=q_nope.device)
-                logger.info(f"--->here, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
+                logger.info(f"--->here, cache_kv_c.shape:{cache_kv_c.shape},cache_k_pe.shape:{cache_k_pe.shape}, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
                             f"value:{v.shape}, seq_len:{seq_len.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
                             f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
 
@@ -840,6 +902,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
                     prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
                     prefill_value_0 = v.detach().cpu().to(torch.float32)
+                    prefill_block_table_0 = prefill_metadata.block_table.detach().cpu()
                     self._maybe_dump_pickle(
                         tag="kv_prefill_context_before_mla",
                         payload={
@@ -850,6 +913,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                             "prefill_k_nope": prefill_k_nope_0.numpy(),
                             "prefill_k_pe": prefill_k_pe_0.numpy(),
                             "prefill_value": prefill_value_0.numpy(),
+                            "prefill_block_table":prefill_block_table_0.numpy(),
                         },
                         step=_dump_step,
                     )
@@ -874,7 +938,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     output=block_out_local,
                     softmax_lse=block_lse_local)
 
-                # 结果级 all_gather + LSE 融合（与 decode 保持一致）
+                # CP维度的融合（SP已在前面处理）
                 def _update_out_and_lse(out, lse, block_out, block_lse, token_mask=None):
                     if out is None:
                         out = block_out.to(torch.float32)
@@ -894,13 +958,13 @@ class AscendMLAImpl(MLAAttentionImpl):
                         lse = torch.where(lse_mask, lse, lse_wo)
                     return out, lse
 
-                logger.info("--->here")
+                logger.info(f"--->here, out shape:{block_out_local.shape}, block_lse_local shape:{block_lse_local.shape}")
                 block_lse_local_bt = block_lse_local.permute(1, 0).unsqueeze(-1)
                 out_lse_local = torch.cat([block_out_local, block_lse_local_bt], dim=-1)
+                
+                # CP维度的all_gather和融合
                 out_lse_list = [torch.empty_like(out_lse_local) for _ in range(self.cp_size)]
                 dist.all_gather(out_lse_list, out_lse_local, group=self.cp_group)
-                seq_len2_list = [torch.empty_like(seq_len2_rank) for _ in range(self.cp_size)]
-                dist.all_gather(seq_len2_list, seq_len2_rank, group=self.cp_group)
                 chunk_out_g = None
                 chunk_lse_g = None
                 for r in range(self.cp_size):
@@ -909,22 +973,26 @@ class AscendMLAImpl(MLAAttentionImpl):
                     logger.info("--->here")
                     out_r, lse_r = torch.split(out_lse_r, [self.v_head_dim, 1], dim=-1)
                     logger.info(f"--->here, out_r shape:{out_r.shape}, lse_r.shape:{lse_r.shape}")
-                    mask_req = (seq_len2_list[r].to(q_nope.device) > 0)
-                    logger.info("--->here")
-                    token_mask = mask_req[req_ids]
-                    logger.info("--->here")
+                    # SP模式下每个rank都处理了完整的SP序列，使用简化的mask
+                    if self.sp_size > 1:
+                        token_mask = torch.ones([out_r.size(0)], dtype=torch.uint8, device=out_r.device)
+                    else:
+                        # 非SP模式使用原有逻辑
+                        mask_req = torch.ones([out_r.size(0)], dtype=torch.uint8, device=out_r.device)  # 简化处理
+                        token_mask = mask_req
                     chunk_out_g, chunk_lse_g = _update_out_and_lse(
                         chunk_out_g, chunk_lse_g, out_r, lse_r, token_mask)
-                    logger.info(f"--->here, chunk shape:{chunk_out_g.shape},{chunk_lse_g.shape}")
+                    logger.info(f"######, chunk shape:{chunk_out_g.shape},{chunk_lse_g.shape}")
                 if chunk_out_g is not None:
                     if prefix_lse_bt is None:
                         prefix_output = chunk_out_g.to(torch.float32)
                         prefix_lse_bt = chunk_lse_g
                     else:
+                        logger.info(f"--->here, chunk shape:{chunk_out_g.shape},{chunk_lse_g.shape}, prefix shape:{prefix_output.shape},{prefix_lse_bt.shape}")
                         prefix_output, prefix_lse_bt = _update_out_and_lse(
                             prefix_output, prefix_lse_bt, chunk_out_g, chunk_lse_g)
                 logger.info(
-                    f"#####> [MLA-CTX-CP] it={i} toks={toks} q_nope.shape={q_nope.shape} k_nope.shape={k_nope.shape} "
+                    f"#####> [MLA-CTX-CP] it={i}  q_nope.shape={q_nope.shape} k_nope.shape={k_nope.shape} "
                     f"v.shape={v.shape} out_local.shape={block_out_local.shape} lse_local.shape={block_lse_local.shape}")
             else:
                 # compute this chunk block then update prefix tensors to keep shapes consistent
@@ -1483,6 +1551,22 @@ class AscendMLAImpl(MLAAttentionImpl):
                 decode_q_pe = self.rope_single(decode_q_pe, cos, sin)
             decode_slots = attn_metadata.slot_mapping[:num_decode_tokens]
             decode_kv_no_split = kv_no_split[:num_decode_tokens]
+            # Debug: dump prefill attention output (local-only, no collective)
+            if self._dump_enabled() and self._decode_step_idx<1:
+                _dump_step = self._decode_step_idx
+                try:
+                    decode_slot_mapping = attn_metadata.slot_mapping.detach().cpu().to(torch.int32)
+                    self._maybe_dump_pickle(
+                        tag="attn_decode_slot_mapping",
+                        payload={
+                            "layer_id": self.layer_id,
+                            "cp_rank": int(self.cp_rank),
+                            "decode_slots":decode_slot_mapping.numpy()
+                        },
+                        step=_dump_step,
+                    )
+                except Exception:
+                    pass
             if self.cp_size * self.sp_size > 1:
                 kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
                 assert len(
@@ -1520,6 +1604,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             prefill_slots = attn_metadata.slot_mapping[
                 num_decode_tokens:num_actual_tokens]
             prefill_q_pe = self.rope_single(prefill_q_pe, cos, sin)
+            self.sp_size = get_tensor_model_parallel_world_size() if self.enable_sp else 1
             if self.cp_size > 1:
                 kv_c, k_pe = prefill_kv_no_split.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
@@ -1543,7 +1628,23 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prefill_k_c_normed = prefill_k_c_normed.squeeze()
                 self.sp_rank = get_tensor_model_parallel_rank() if self.enable_sp else 0
                 self.cp_rank = get_context_model_parallel_rank() if self.enable_sp else 0
-                logger.info(f"====> cp_rank:{self.cp_rank},sp_rank:{self.sp_rank}, slot mapping:{attn_metadata.slot_mapping}")
+                logger.info(f"====> cp_rank:{self.cp_rank},sp_rank:{self.sp_rank}, slot mapping:{attn_metadata.slot_mapping}, kv cache shape:{kv_cache[0].shape},{kv_cache[1].shape}")
+                if self._dump_enabled():
+                    _dump_step = self._prefill_step_idx
+                    try:
+                        decode_slot_mapping = attn_metadata.slot_mapping.detach().cpu().to(torch.int32)
+                        self._maybe_dump_pickle(
+                            tag="attn_prefill_slot_mapping",
+                            payload={
+                                "layer_id": self.layer_id,
+                                "cp_rank": int(self.cp_rank),
+                                "decode_slots":decode_slot_mapping.numpy()
+                            },
+                            step=_dump_step,
+                        )
+                    except Exception:
+                        pass
+
                 torch_npu._npu_reshape_and_cache(
                     key=kv_c_normed,
                     value=k_pe,
@@ -1561,6 +1662,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                             logger.info(f"[dump info], kv_c_normed shape:{kv_c_normed.shape}, k_pe shape:{k_pe.shape}")
                             kv0 = kv_c_normed.detach().cpu().to(torch.float32)
                             kv1 = k_pe.detach().cpu().to(torch.float32)
+                            kv_cache_0 = kv_cache[0][0:128].cpu().to(torch.float32)
+                            kv_cache_1 = kv_cache[1][0:128].cpu().to(torch.float32)
                         self._maybe_dump_pickle(
                             tag="kv_prefill",
                             payload={
@@ -1570,6 +1673,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                                 "kv_rope_blocks": kv1.numpy(),
                                 "block_size": int(kv_cache[0].shape[1]) if len(kv_cache[0].shape) > 1 else None,
                                 "slot_mapping":attn_metadata.slot_mapping,
+                                "kv_cache_0":kv_cache_0,
+                                "kv_cache_1":kv_cache_1,
                             },
                             step=_dump_step,
                         )
@@ -1693,6 +1798,31 @@ class AscendMLAImpl(MLAAttentionImpl):
             seq_len_kv = seq_len
             seq_len_all = torch.stack([seq_len_q, seq_len_kv])
 
+            if self._dump_enabled() and self._decode_step_idx < 1:
+                _dump_step = self._decode_step_idx
+                prefill_q_nope_0 = q_nope.detach().cpu().to(torch.float32)
+                prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
+                prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
+                prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
+                prefill_value_0 = v.detach().cpu().to(torch.float32)
+                #kv_c_and_k_pe_cache_0 = kv_c_and_k_pe_cache[0].detach().cpu().to(torch.float32)
+                #kv_c_and_k_pe_cache_1 = kv_c_and_k_pe_cache[1].detach().cpu().to(torch.float32)
+                self._maybe_dump_pickle(
+                    tag="kv_decode_before_mla",
+                    payload={
+                        "layer_id": self.layer_id,
+                        "cp_rank": int(self.cp_rank),
+                        "prefill_q_nope_top": prefill_q_nope_0.numpy(),
+                        "prefill_q_pe_top": prefill_q_pe_0.numpy(),
+                        "prefill_k_nope": prefill_k_nope_0.numpy(),
+                        "prefill_k_pe": prefill_k_pe_0.numpy(),
+                        "prefill_value": prefill_value_0.numpy(),
+                        #"kv_c_and_k_pe_cache_0":kv_c_and_k_pe_cache_0.numpy(),
+                        #"kv_c_and_k_pe_cache_1":kv_c_and_k_pe_cache_1.numpy(),
+                    },
+                    step=_dump_step,
+                )
+
             attn_output, softmax_lse = torch_npu.atb.npu_ring_mla(
                 q_nope=q_nope,          # [batch_size, num_heads_full(16), qk_nope_head_dim(128)]
                 q_rope=q_pe,            # [batch_size, num_heads_full(16), qk_rope_head_dim(64)]
@@ -1811,6 +1941,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                    dtype=hidden_states.dtype,
                                    device=hidden_states.device)
 
+        logger.info(f"===============> kv cache shape:{kv_cache[0].shape},{kv_cache[1].shape}")
         # MLA Preprocess
         decode_preprocess_res, prefill_preprocess_res = self._mla_preprocess(
             hidden_states, kv_cache, attn_metadata, need_gather_q_kv)
@@ -1839,6 +1970,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     current_ms_metadata.after_comm_event.record()
             else:
                 o_proj_input[:num_decode_tokens] = output_decode
+            self._prefill_step_idx += 1
 
         if prefill_preprocess_res is not None:
             # FIX: aicore move should be also placed on the comm stream in dbo,
