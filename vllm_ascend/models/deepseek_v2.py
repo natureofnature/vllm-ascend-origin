@@ -73,6 +73,7 @@ from vllm_ascend.ops.fused_moe import AscendFusedMoE
 from vllm_ascend.quantization.quant_config import AscendLinearMethod
 from vllm_ascend.quantization.w8a8_dynamic import AscendW8A8DynamicLinearMethod
 from vllm_ascend.utils import dispose_tensor
+from vllm.logger import logger
 
 
 class CustomDeepseekV2SiluAndMul(SiluAndMul):
@@ -828,6 +829,10 @@ class CustomDeepseekV2Model(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+        if attn_metadata is None:
+            logger.info(f"called in forward in CustomDeepseekV2Model with none attn meta")
+        else:
+            logger.info(f"called in forward in CustomDeepseekV2Model with not none attn meta")
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
@@ -1006,6 +1011,17 @@ class CustomDeepseekV2ForCausalLM(DeepseekV2ForCausalLM):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
+
+        if attn_metadata is None:
+            logger.info(f"called in forward in CustomDeepseekV2Model with none attn meta")
+        else:
+            logger.info(f"called in forward in CustomDeepseekV2Model with not none attn meta")
+
+        if kv_caches is None:
+            logger.info("=====> kv cache is None")
+        else:
+            shapes = [t.shape for t in kv_caches]
+            logger.info(f"=====> kv cache is not None, with shapes:{shapes}")
         hidden_states = self.model(input_ids, positions, kv_caches,
                                    attn_metadata, intermediate_tensors,
                                    inputs_embeds)

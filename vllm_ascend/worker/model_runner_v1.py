@@ -784,6 +784,12 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         self.query_start_loc[:num_reqs + 1].copy_(
             self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
+
+        if self.chunked_prefill_enabled:
+            # 刷新 seq_lens_cpu = 已计算 + 本步新发，防止 MLA 里误把本步新发算进上下文长度
+            self.seq_lens_cpu[:num_reqs].copy_(
+                torch.from_numpy(self.input_batch.num_computed_tokens_cpu[:num_reqs] +
+                                self.query_lens[:num_reqs].numpy()))
         self.seq_lens[:num_reqs].copy_(self.seq_lens_cpu[:num_reqs],
                                        non_blocking=True)
 
@@ -1097,25 +1103,52 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         num_computed_and_new_tokens_batch = np.array(
             self.input_batch.num_computed_tokens_of_cp_sp[:self.input_batch.num_reqs])
         start_index = 0
-        for i in range(self.input_batch.num_reqs):
-            block_table_req = block_table_cpu[i]
-            block_table_indices = np.repeat(block_table_req, self.block_size)
-            # 使用调度阶段计算的各 rank 保存总数，保证与 KV 写入/读取顺序一致
-            num_save_tokens_rank = num_computed_and_new_tokens_batch[i][self.cp_rank][self.sp_rank]
+        if self.chunked_prefill_enabled:
+            for i in range(self.input_batch.num_reqs):
+                block_table_req = block_table_cpu[i]
+                block_table_indices = np.repeat(block_table_req, self.block_size)
+                prev_computed_total = int(self.input_batch.num_computed_tokens_cpu[i])
+                cum_for_rank = int(num_computed_and_new_tokens_batch[i][self.cp_rank][self.sp_rank])
+                num_new_tokens_rank = max(0, cum_for_rank - prev_computed_total)
 
-            positions_for_slot = self.arange_np[:num_save_tokens_rank]
-            block_offsets = positions_for_slot % self.block_size
-            slot_mapping = (block_table_indices * self.block_size)[:num_save_tokens_rank] + block_offsets
+                if num_new_tokens_rank > 0:
+                    kv_save_start_step = 0
+                    # 只按 CP 累加，SP 不改变序列窗口（SP 相当于 TP，不切分序列）
+                    if self.cp_rank > 0:
+                        # 仅累加更小 CP 的新写长度，每个 CP 只计一次（取 sp=0 列），避免按 SP 重复累加
+                        kv_save_start_step += int(np.maximum(
+                            num_computed_and_new_tokens_batch[i][:self.cp_rank, 0] - prev_computed_total, 0).sum())
 
-            num_cp_padded_scheduled_tokens = num_scheduled_tokens_for_slot[i]
-            # 计算在本步连续缓冲区内的起始偏移：为该请求在本步内，位于 (cp, sp) 前所有 rank 的保存数量之和
-            kv_save_start = np.sum(num_computed_and_new_tokens_batch[i][:self.cp_rank]) + \
-                np.sum(num_computed_and_new_tokens_batch[i][self.cp_rank][:self.sp_rank])
+                    absolute_start_pos = prev_computed_total + kv_save_start_step
+                    positions_for_slot_abs = absolute_start_pos + self.arange_np[:num_new_tokens_rank]
+                    block_offsets = positions_for_slot_abs % self.block_size
+                    slot_mapping = (block_table_indices * self.block_size)[positions_for_slot_abs] + block_offsets
 
-            self.slot_mapping_np[
-            start_index + kv_save_start:start_index + kv_save_start + num_save_tokens_rank] = slot_mapping
+                    self.slot_mapping_np[
+                        start_index + kv_save_start_step:
+                        start_index + kv_save_start_step + num_new_tokens_rank] = slot_mapping
 
-            start_index += num_cp_padded_scheduled_tokens
+                start_index += num_scheduled_tokens_for_slot[i]
+        else:
+            for i in range(self.input_batch.num_reqs):
+                block_table_req = block_table_cpu[i]
+                block_table_indices = np.repeat(block_table_req, self.block_size)
+                # 使用调度阶段计算的各 rank 保存总数，保证与 KV 写入/读取顺序一致
+                num_save_tokens_rank = num_computed_and_new_tokens_batch[i][self.cp_rank][self.sp_rank]
+
+                positions_for_slot = self.arange_np[:num_save_tokens_rank]
+                block_offsets = positions_for_slot % self.block_size
+                slot_mapping = (block_table_indices * self.block_size)[:num_save_tokens_rank] + block_offsets
+
+                num_cp_padded_scheduled_tokens = num_scheduled_tokens_for_slot[i]
+                # 计算在本步连续缓冲区内的起始偏移：为该请求在本步内，位于 (cp, sp) 前所有 rank 的保存数量之和
+                kv_save_start = np.sum(num_computed_and_new_tokens_batch[i][:self.cp_rank]) + \
+                    np.sum(num_computed_and_new_tokens_batch[i][self.cp_rank][:self.sp_rank])
+
+                self.slot_mapping_np[
+                start_index + kv_save_start:start_index + kv_save_start + num_save_tokens_rank] = slot_mapping
+
+                start_index += num_cp_padded_scheduled_tokens
 
     def _slot_mapping_decode_cp(
             self,

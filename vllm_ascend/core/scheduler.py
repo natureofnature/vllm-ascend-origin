@@ -158,24 +158,25 @@ class AscendScheduler(Scheduler):
                     start_token = num_computed_tokens
                     end_token = num_computed_tokens + num_new_tokens
                     chunk_token_ids = request.all_token_ids[start_token:end_token]
-                    # block 对齐后按 cp*sp 均分
+                    # 仅按 CP 均分序列，SP 复制该 CP 段（SP 相当于 TP，不切分序列）
                     num_total_blocks = cdiv(num_new_tokens, self.block_size)
-                    flat = [num_total_blocks // (self.cp_size * self.sp_size)] * (self.cp_size * self.sp_size)
-                    remain_blocks = num_total_blocks % (self.cp_size * self.sp_size)
+                    flat_cp = [num_total_blocks // self.cp_size] * self.cp_size
+                    remain_blocks = num_total_blocks % self.cp_size
                     for i in range(remain_blocks):
-                        flat[i] += 1
-                    num_blocks_of_cp_sp = np.array(flat).reshape(self.cp_size, self.sp_size)
+                        flat_cp[i] += 1
+                    num_blocks_of_cp_sp = np.tile(np.array(flat_cp).reshape(self.cp_size, 1), (1, self.sp_size))
                     request.num_blocks_of_cp_sp = num_blocks_of_cp_sp
                     # 顺序切分 chunk，计算每 rank 的新 token 与本步需保存的 kv 数
                     start_id = 0
                     request.token_ids_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
                     request.num_computed_tokens_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
                     for i in range(self.cp_size):
+                        length = int(num_blocks_of_cp_sp[i][0]) * self.block_size
+                        cp_tokens = chunk_token_ids[start_id:start_id + length]
                         for j in range(self.sp_size):
-                            length = int(num_blocks_of_cp_sp[i][j]) * self.block_size
-                            request.token_ids_of_cp_sp[i][j] = chunk_token_ids[start_id:start_id + length]
-                            request.num_computed_tokens_of_cp_sp[i][j] = len(request.token_ids_of_cp_sp[i][j]) + num_computed_tokens
-                            start_id += length
+                            request.token_ids_of_cp_sp[i][j] = cp_tokens
+                            request.num_computed_tokens_of_cp_sp[i][j] = len(cp_tokens) + num_computed_tokens
+                        start_id += length
                     logger.info(
                         f"======> [SCH-PREFILL] req={request.request_id} chunk step_tokens={num_new_tokens} "
                         f"cp={self.cp_size} sp={self.sp_size} num_blocks_of_cp_sp.shape={num_blocks_of_cp_sp.shape} "
@@ -197,6 +198,7 @@ class AscendScheduler(Scheduler):
                             request.token_ids_of_cp_sp[i][j] = request.all_token_ids[start_id:start_id + request.num_blocks_of_cp_sp[i][j] * self.block_size]
                             request.num_computed_tokens_of_cp_sp[i][j] = len(request.token_ids_of_cp_sp[i][j]) + num_computed_tokens
                             start_id += request.num_blocks_of_cp_sp[i][j] * self.block_size
+                   
             elif chunked_prefill:
                 # 非 CP/SP 模式但启用了 chunked prefill：为兼容性初始化必要的属性
                 # 使用单一的 cp=1, sp=1 维度来模拟原有行为

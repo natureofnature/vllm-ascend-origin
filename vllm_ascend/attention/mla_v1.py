@@ -408,7 +408,7 @@ class AscendMLAMetadataBuilder:
                 attn_mask=common_attn_metadata.attn_mask,
                 query_lens=query_lens[reqs_start:],
                 seq_lens=seq_lens,
-                context_lens=seq_lens[reqs_start:],
+                context_lens=num_computed_tokens_cpu[reqs_start:],
                 input_positions=prefill_input_positions,
                 block_table=block_table[reqs_start:, ...],
                 max_query_len=max_query_len,
@@ -771,14 +771,26 @@ class AscendMLAImpl(MLAAttentionImpl):
                 self.prefill_mask = mask_local
             logger.info(f"+++++++====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
         
-        mask_local = torch.ones_like(mask_local)
+        # Keep the causal mask; do not override to all-ones.
 
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
 
-            seq_len2 = prefill_metadata.chunked_context.chunk_seq_lens[i].to(q_nope.device, dtype=torch.int32).contiguous()
-            seq_len = torch.stack([seq_len1.cpu(), seq_len2.cpu()])
+            # Restrict KV to current CP-rank's slice within this chunk
+            seq_len2_cpu = prefill_metadata.chunked_context.chunk_seq_lens[i].to('cpu', dtype=torch.int32)
+            starts_cpu = prefill_metadata.chunked_context.starts[i].to('cpu', dtype=torch.int32)
+            lens_np = seq_len2_cpu.numpy()
+            base_np = lens_np // self.cp_size if self.cp_size > 0 else lens_np
+            rem_np = lens_np % self.cp_size if self.cp_size > 0 else 0
+            cp_rank = get_context_model_parallel_rank() if self.cp_size > 1 else 0
+            pre_np = base_np * cp_rank + np.minimum(rem_np, cp_rank)
+            cur_np = base_np + (rem_np > cp_rank).astype(np.int32)
+            starts_rank_np = starts_cpu.numpy() + pre_np
+
+            seq_len2_rank = torch.from_numpy(cur_np).to(q_nope.device, non_blocking=True)
+            starts_rank = torch.from_numpy(starts_rank_np).to(q_nope.device, non_blocking=True)
+            seq_len = torch.stack([seq_len1.cpu(), seq_len2_rank.cpu()])
             kv_c_normed = torch.empty(toks,
                                       num_heads,
                                       latent_kv_dim,
@@ -789,14 +801,14 @@ class AscendMLAImpl(MLAAttentionImpl):
                                rope_dim,
                                dtype=q_nope.dtype,
                                device=q_nope.device)
-            logger.info("--->here")
+            logger.info(f"--->here, prefill context start location:{prefill_metadata.chunked_context.starts[i]}")
 
             torch_npu.atb.npu_paged_cache_load(
                 cache_kv_c,
                 cache_k_pe,
                 prefill_metadata.block_table,
-                seq_len2.to(q_nope.device),
-                seq_starts=prefill_metadata.chunked_context.starts[i],
+                seq_len2_rank,
+                seq_starts=starts_rank,
                 key=kv_c_normed,
                 value=k_pe,
             )
@@ -819,6 +831,29 @@ class AscendMLAImpl(MLAAttentionImpl):
                 logger.info(f"--->here, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
                             f"value:{v.shape}, seq_len:{seq_len.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
                             f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
+
+
+                if self._dump_enabled():
+                    _dump_step = self._prefill_step_idx
+                    prefill_q_nope_0 = q_nope.detach().cpu().to(torch.float32)
+                    prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
+                    prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
+                    prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
+                    prefill_value_0 = v.detach().cpu().to(torch.float32)
+                    self._maybe_dump_pickle(
+                        tag="kv_prefill_context_before_mla",
+                        payload={
+                            "layer_id": self.layer_id,
+                            "cp_rank": int(self.cp_rank),
+                            "prefill_q_nope": prefill_q_nope_0.numpy(),
+                            "prefill_q_pe": prefill_q_pe_0.numpy(),
+                            "prefill_k_nope": prefill_k_nope_0.numpy(),
+                            "prefill_k_pe": prefill_k_pe_0.numpy(),
+                            "prefill_value": prefill_value_0.numpy(),
+                        },
+                        step=_dump_step,
+                    )
+
                 torch_npu.atb.npu_ring_mla(
                     q_nope=q_nope,
                     q_rope=q_pe,
@@ -864,8 +899,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 out_lse_local = torch.cat([block_out_local, block_lse_local_bt], dim=-1)
                 out_lse_list = [torch.empty_like(out_lse_local) for _ in range(self.cp_size)]
                 dist.all_gather(out_lse_list, out_lse_local, group=self.cp_group)
-                seq_len2_list = [torch.empty_like(seq_len2) for _ in range(self.cp_size)]
-                dist.all_gather(seq_len2_list, seq_len2, group=self.cp_group)
+                seq_len2_list = [torch.empty_like(seq_len2_rank) for _ in range(self.cp_size)]
+                dist.all_gather(seq_len2_list, seq_len2_rank, group=self.cp_group)
                 chunk_out_g = None
                 chunk_lse_g = None
                 for r in range(self.cp_size):
@@ -1061,6 +1096,37 @@ class AscendMLAImpl(MLAAttentionImpl):
         head_attn_nomask_seqlens = attn_metadata.prefill.head_attn_nomask_seqlens
         tail_attn_nomask_seqlens = attn_metadata.prefill.tail_attn_nomask_seqlens
         mask = attn_metadata.prefill.cp_prefill_mask
+
+
+
+        if self._dump_enabled():
+            _dump_step = self._prefill_step_idx
+            prefill_q_nope_0 = torch.index_select(q_nope, 0, q_head_idx).detach().cpu().to(torch.float32)
+            prefill_q_pe_0 = torch.index_select(q_pe, 0, q_head_idx).detach().cpu().to(torch.float32)
+            prefill_q_nope_1 = torch.index_select(q_nope, 0, q_tail_idx).detach().cpu().to(torch.float32)
+            prefill_q_pe_1 = torch.index_select(q_pe, 0, q_tail_idx).detach().cpu().to(torch.float32)
+            prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
+            prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
+            prefill_value_0 = value.detach().cpu().to(torch.float32)
+            kv_c_and_k_pe_cache_0 = kv_c_and_k_pe_cache[0].detach().cpu().to(torch.float32)
+            kv_c_and_k_pe_cache_1 = kv_c_and_k_pe_cache[1].detach().cpu().to(torch.float32)
+            self._maybe_dump_pickle(
+                tag="kv_prefill_causal_before_mla",
+                payload={
+                    "layer_id": self.layer_id,
+                    "cp_rank": int(self.cp_rank),
+                    "prefill_q_nope_top": prefill_q_nope_0.numpy(),
+                    "prefill_q_pe_top": prefill_q_pe_0.numpy(),
+                    "prefill_q_nope_head": prefill_q_nope_1.numpy(),
+                    "prefill_q_pe_head": prefill_q_pe_1.numpy(),
+                    "prefill_k_nope": prefill_k_nope_0.numpy(),
+                    "prefill_k_pe": prefill_k_pe_0.numpy(),
+                    "prefill_value": prefill_value_0.numpy(),
+                    "kv_c_and_k_pe_cache_0":kv_c_and_k_pe_cache_0.numpy(),
+                    "kv_c_and_k_pe_cache_1":kv_c_and_k_pe_cache_1.numpy(),
+                },
+                step=_dump_step,
+            )
 
         output_head, head_lse = self._attention_with_mask_and_nomask(
             q_nope=torch.index_select(q_nope, 0, q_head_idx),
@@ -1503,6 +1569,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                 "kv_nope_blocks": kv0.numpy(),
                                 "kv_rope_blocks": kv1.numpy(),
                                 "block_size": int(kv_cache[0].shape[1]) if len(kv_cache[0].shape) > 1 else None,
+                                "slot_mapping":attn_metadata.slot_mapping,
                             },
                             step=_dump_step,
                         )
