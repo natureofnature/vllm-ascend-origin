@@ -198,7 +198,8 @@ class AscendScheduler(Scheduler):
                     request.token_ids_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
                     request.num_computed_tokens_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
                     # 初始化单独累加的token数
-                    request.num_computed_tokens_of_cp_sp_single = [[0] * self.sp_size for _ in range(self.cp_size)]
+                    if not hasattr(request, 'num_computed_tokens_of_cp_sp_single') or request.num_computed_tokens_of_cp_sp_single is None:
+                        request.num_computed_tokens_of_cp_sp_single = [[0] * self.sp_size for _ in range(self.cp_size)]
                     for i in range(self.cp_size):
                         for j in range(self.sp_size):
                             request.token_ids_of_cp_sp[i][j] = request.all_token_ids[start_id:start_id + request.num_blocks_of_cp_sp[i][j] * self.block_size]
@@ -206,6 +207,7 @@ class AscendScheduler(Scheduler):
                             # 非chunked模式下，单独累加数等于总数
                             request.num_computed_tokens_of_cp_sp_single[i][j] = len(request.token_ids_of_cp_sp[i][j])
                             start_id += request.num_blocks_of_cp_sp[i][j] * self.block_size
+                            logger.info(f"cp:{i},sp{j}, num_computed_tokens_of_cp_sp_single:{request.num_computed_tokens_of_cp_sp_single[i][j]}, request.num_computed_tokens_of_cp_sp[i][j]:{request.num_computed_tokens_of_cp_sp[i][j]}")
                    
             elif chunked_prefill:
                 # 非 CP/SP 模式但启用了 chunked prefill：为兼容性初始化必要的属性
@@ -387,8 +389,8 @@ class AscendScheduler(Scheduler):
                             request.num_computed_tokens_of_cp_sp[i][j] = len(request.token_ids_of_cp_sp[i][j]) + num_computed_tokens
                             # 只累加该rank自己的token数
                             request.num_computed_tokens_of_cp_sp_single[i][j] += len(request.token_ids_of_cp_sp[i][j])
+                            logger.info(f"cp:{i},sp{j}, num_computed_tokens_of_cp_sp_single:{request.num_computed_tokens_of_cp_sp_single[i][j]}, request.num_computed_tokens_of_cp_sp[i][j]:{request.num_computed_tokens_of_cp_sp[i][j]}")
                             start_id += length
-                    logger.info(f"cp:{i},sp{j}, num_computed_tokens_of_cp_sp_single:{request.num_computed_tokens_of_cp_sp_single[i][j]}, request.num_computed_tokens_of_cp_sp[i][j]:{request.num_computed_tokens_of_cp_sp[i][j]}")
                     logger.info(
                         f"======> [SCH-RUNNING] req={request.request_id} chunk step_tokens={num_new_tokens} "
                         f"cp={self.cp_size} sp={self.sp_size} num_blocks_of_cp_sp.shape={num_blocks_of_cp_sp.shape} "
@@ -472,6 +474,8 @@ class AscendScheduler(Scheduler):
                     # logger.info(f'>>>>> scheduler, num_computed_tokens_of_cp_sp={request.num_computed_tokens_of_cp_sp}, kv_rank={kv_rank}')
 
                     request.token_ids_of_cp_sp[kv_rank[0]][kv_rank[1]].append(request.output_token_ids[-1])   #更新一下，暂时用不上
+                    logger.info(f"!!!request.token_ids_of_cp_sp[kv_rank[0]][kv_rank[1]]={request.token_ids_of_cp_sp[kv_rank[0]][kv_rank[1]]}")
+
                     request.kv_rank = kv_rank
 
                 num_new_tokens = (request.num_tokens_with_spec -
@@ -510,6 +514,7 @@ class AscendScheduler(Scheduler):
                     if self.cp_size * self.sp_size > 1:
                         computed_tokens = request.num_computed_tokens
                         request.num_computed_tokens = min(min(request.num_computed_tokens_of_cp_sp))
+                        logger.info(f"!!!request.num_computed_tokens={request.num_computed_tokens}")
                     new_blocks = self.kv_cache_manager.allocate_slots(
                         request,
                         num_new_tokens,
@@ -553,6 +558,7 @@ class AscendScheduler(Scheduler):
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 if self.cp_size * self.sp_size > 1:
                     request.num_computed_tokens_of_cp_sp[kv_rank[0]][kv_rank[1]] += num_new_tokens
+                    logger.info(f"!!!request.num_computed_tokens_of_cp_sp[kv_rank[0]][kv_rank[1]] = {request.num_computed_tokens_of_cp_sp[kv_rank[0]][kv_rank[1]]}, num_new_tokens:{num_new_tokens}")
                 token_budget -= num_new_tokens
                 req_index += 1
 

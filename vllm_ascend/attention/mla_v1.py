@@ -1523,6 +1523,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         prefill_preprocess_res = None
         # Preprocess for decode tokens
         if has_decode:
+
+            logger.info(f"in decode mla, hidden states:{hidden_states}, qc:{q_c}")
             self.sp_size = get_tensor_model_parallel_world_size() if self.enable_sp else 1
             decode_q_c = q_c[:num_decode_tokens]
             cos = attn_metadata.decode.cos
@@ -1552,21 +1554,29 @@ class AscendMLAImpl(MLAAttentionImpl):
             decode_slots = attn_metadata.slot_mapping[:num_decode_tokens]
             decode_kv_no_split = kv_no_split[:num_decode_tokens]
             # Debug: dump prefill attention output (local-only, no collective)
+            logger.info(f"-------------has decode in mla preprocess")
             if self._dump_enabled() and self._decode_step_idx<1:
                 _dump_step = self._decode_step_idx
-                try:
-                    decode_slot_mapping = attn_metadata.slot_mapping.detach().cpu().to(torch.int32)
-                    self._maybe_dump_pickle(
-                        tag="attn_decode_slot_mapping",
-                        payload={
-                            "layer_id": self.layer_id,
-                            "cp_rank": int(self.cp_rank),
-                            "decode_slots":decode_slot_mapping.numpy()
-                        },
-                        step=_dump_step,
-                    )
-                except Exception:
-                    pass
+                decode_slot_mapping = attn_metadata.slot_mapping.detach().cpu().to(torch.int32)
+                decode_qc_0 = decode_q_c.detach().cpu().to(torch.float32)
+                decode_q_wo_k_up_0 = decode_q_wo_k_up.detach().cpu().to(torch.float32)
+                decode_q_wo_k_up_pe_0 = decode_q_wo_k_up_pe.detach().cpu().to(torch.float32)
+                #decode_q_pe_0 = decode_q_pe.detach().cpu().to(torch.float32)
+                self._maybe_dump_pickle(
+                    tag="attn_decode_slot_mapping",
+                    payload={
+                        "layer_id": self.layer_id,
+                        "cp_rank": int(self.cp_rank),
+                        "q_c":q_c.detach().cpu().to(torch.float32),
+                        "hidden_states":hidden_states.detach().cpu().to(torch.float32),
+                        "decode_slots":decode_slot_mapping.numpy(),
+                        "decode_qc":decode_qc_0.numpy(),
+                        "decode_q_wo_k_up":decode_q_wo_k_up_0.numpy(),
+                        "decode_q_wo_k_up_pe":decode_q_wo_k_up_pe_0.numpy(),
+                        #"decode_q_pe":decode_q_pe_0.numpy()
+                    },
+                    step=_dump_step,
+                )
             if self.cp_size * self.sp_size > 1:
                 kv_c_normed = self.kv_a_layernorm(kv_c.contiguous())
                 assert len(
@@ -1839,7 +1849,42 @@ class AscendMLAImpl(MLAAttentionImpl):
                 input_layout="type_bsnd",
                 calc_type="calc_type_first_ring",
             )
-        # attn_output: [bs, num_heads_full(16), v_head_dim(128)], softmax_lse: [num_heads_full(16), bs]
+
+            logger.info(f"cp{self.cp_rank},sp{self.sp_rank},decode step:{self._decode_step_idx},seqlen:{seq_len_all}")
+            # attn_output: [bs, num_heads_full(16), v_head_dim(128)], softmax_lse: [num_heads_full(16), bs]
+            if self._dump_enabled() and self._decode_step_idx < 1:
+                _dump_step = self._decode_step_idx
+                prefill_q_nope_0 = q_nope.detach().cpu().to(torch.float32)
+                prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
+                prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
+                prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
+                prefill_value_0 = v.detach().cpu().to(torch.float32)
+                seqlen_0 = seq_len_all[0].detach().cpu().to(torch.int32),
+                seqlen_1 = seq_len_all[1].detach().cpu().to(torch.int32),
+                attn_output_0 = attn_output.detach().cpu().to(torch.float32),
+                softmax_lse_0 = softmax_lse.detach().cpu().to(torch.float32),
+                #kv_c_and_k_pe_cache_0 = kv_c_and_k_pe_cache[0].detach().cpu().to(torch.float32)
+                #kv_c_and_k_pe_cache_1 = kv_c_and_k_pe_cache[1].detach().cpu().to(torch.float32)
+                self._maybe_dump_pickle(
+                    tag="kv_decode_after_mla",
+                    payload={
+                        "layer_id": self.layer_id,
+                        "cp_rank": int(self.cp_rank),
+                        "prefill_q_nope_top": prefill_q_nope_0.numpy(),
+                        "prefill_q_pe_top": prefill_q_pe_0.numpy(),
+                        "prefill_k_nope": prefill_k_nope_0.numpy(),
+                        "prefill_k_pe": prefill_k_pe_0.numpy(),
+                        "prefill_value": prefill_value_0.numpy(),
+                        "seqlen_all_0":seqlen_0,
+                        "seqlen_all_1":seqlen_1,
+                        "attn_output": attn_output_0,
+                        "softmax_lse": softmax_lse_0,
+                        #"kv_c_and_k_pe_cache_0":kv_c_and_k_pe_cache_0.numpy(),
+                        #"kv_c_and_k_pe_cache_1":kv_c_and_k_pe_cache_1.numpy(),
+                    },
+                    step=_dump_step,
+                )
+
 
         # TODO use update op to replace this
         def _update_out_and_lse(
@@ -1970,7 +2015,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     current_ms_metadata.after_comm_event.record()
             else:
                 o_proj_input[:num_decode_tokens] = output_decode
-            self._prefill_step_idx += 1
+            self._decode_step_idx += 1
 
         if prefill_preprocess_res is not None:
             # FIX: aicore move should be also placed on the comm stream in dbo,

@@ -1690,6 +1690,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             input_ids, positions, num_input_tokens, with_prefill,
             maybe_padded_num_tokens)
 
+
         if get_pp_group().is_first_rank:
             intermediate_tensors = None
         else:
@@ -1740,6 +1741,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             logits_indices = nn.functional.pad(
                 logits_indices,
                 (0, max_num_reqs_across_dp - logits_indices.shape[0]))
+
+        if not is_prefill:
+            logger.info(f"!!! cp:{self.cp_rank}, sp:{self.sp_rank},positions:{positions}, input_ids:{input_ids},input_embeds:{inputs_embeds}")
 
         return (attn_metadata, positions, num_scheduled_tokens,
                 num_input_tokens, num_tokens_across_dp,

@@ -846,6 +846,8 @@ class CustomDeepseekV2Model(nn.Module):
 
         replace_allreduce = hidden_states.shape[0] % self.tp_size == 0
 
+        logger.info(f"before layers, hidden states:{hidden_states}, input_ids:{input_ids}")
+
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states, residual = layer(
