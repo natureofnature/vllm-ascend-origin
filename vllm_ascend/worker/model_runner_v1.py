@@ -469,6 +469,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 lora_request=new_req_data.lora_request,
                 num_computed_tokens_of_cp_sp=new_req_data.num_computed_tokens_of_cp_sp,
                 num_computed_tokens_of_cp_sp_single=new_req_data.num_computed_tokens_of_cp_sp_single,
+                num_computed_tokens_of_cp_sp_current=new_req_data.num_computed_tokens_of_cp_sp_current,
                 **({
                     "mm_hashes": new_req_data.mm_hashes
                 } if not (vllm_version_is("0.10.1.1")
@@ -526,6 +527,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             req_state.kv_rank = req_data.kv_rank[i]
             req_state.num_computed_tokens_of_cp_sp = req_data.num_computed_tokens_of_cp_sp[i]
             req_state.num_computed_tokens_of_cp_sp_single = req_data.num_computed_tokens_of_cp_sp_single[i]
+            req_state.num_computed_tokens_of_cp_sp_current = req_data.num_computed_tokens_of_cp_sp_current[i]
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_data.resumed_from_preemption[i]
@@ -574,6 +576,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.input_batch.kv_rank[req_index] = req_state.kv_rank
             self.input_batch.num_computed_tokens_of_cp_sp[req_index] = req_state.num_computed_tokens_of_cp_sp
             self.input_batch.num_computed_tokens_of_cp_sp_single[req_index] = req_state.num_computed_tokens_of_cp_sp_single
+            self.input_batch.num_computed_tokens_of_cp_sp_current[req_index] = req_state.num_computed_tokens_of_cp_sp_current
 
             # Update the persistent batch.
             self.input_batch.num_computed_tokens_cpu[req_index] = (
@@ -1104,6 +1107,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         block_table_cpu = self.input_batch.block_table[0].get_cpu_tensor()
         num_computed_and_new_tokens_batch = np.array(
             self.input_batch.num_computed_tokens_of_cp_sp[:self.input_batch.num_reqs])
+        num_computed_and_new_tokens_batch_single = np.array(
+            self.input_batch.num_computed_tokens_of_cp_sp_single[:self.input_batch.num_reqs])
+        num_computed_and_new_tokens_batch_current = np.array(
+            self.input_batch.num_computed_tokens_of_cp_sp_current[:self.input_batch.num_reqs])
         logger.info(f"===> slot mapping prefill cp, num_computed_and_new_tokens_batch:{num_computed_and_new_tokens_batch}")
         start_index = 0
         if self.chunked_prefill_enabled:
@@ -1117,8 +1124,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 n_new_rank = max(0, cum_rank - prev)
                 logger.info(f"===> slot mapping prefill cp, cp rank:{self.cp_rank}, cum_rank:{cum_rank}, n_new_rank:{n_new_rank}, prev:{prev}")
                 if n_new_rank > 0:
-                    kv_save_start = np.sum(num_computed_and_new_tokens_batch[i][:self.cp_rank]) + \
-                        np.sum(num_computed_and_new_tokens_batch[i][self.cp_rank][:self.sp_rank])
+                    #TODO: here should use num_computed_and_new_tokens_batch_current_chunk instead of all history
+                    kv_save_start = np.sum(num_computed_and_new_tokens_batch_current[i][:self.cp_rank]) + \
+                        np.sum(num_computed_and_new_tokens_batch_current[i][self.cp_rank][:self.sp_rank])
 
                     total_rank_tokens = self.input_batch.num_computed_tokens_of_cp_sp_single[i][self.cp_rank][self.sp_rank]
                     start_pos = total_rank_tokens - n_new_rank  # 该rank在当前chunk之前已处理的token数
@@ -1161,7 +1169,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                             'block_table_indices': to_numpy(block_table_indices),
                             'block_size': self.block_size,
                             'kv_save_start_step': kv_save_start,
-                            'start_index': start_index
+                            'start_index': start_index,
+                            'num_computed_tokens_single':num_computed_and_new_tokens_batch_single,
+                            'num_computed_tokens_all':num_computed_and_new_tokens_batch,
+                            'num_computed_tokens_current':num_computed_and_new_tokens_batch_current,
+
                         }
                         with open(dump_file, 'wb') as f:
                             pickle.dump(debug_data, f)
@@ -1193,7 +1205,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
                 self.slot_mapping_np[
                 start_index + kv_save_start:start_index + kv_save_start + num_save_tokens_rank] = slot_mapping
-                logger.info(f"===> slot mapping prefill cp, cp rank:{self.cp_rank}, block_table_req:{block_table_req}, block_table_indices:{block_table_indices}, num_save_token_rank:{num_save_tokens_rank}, position for slot:{positions_for_slot},"
+                cp_rank =get_context_model_parallel_rank()
+                sp_rank = get_tensor_model_parallel_rank()
+                logger.info(f"===> slot mapping prefill cp, cp rank:{self.cp_rank},sp rank:{sp_rank}, block_table_req:{block_table_req}, block_table_indices:{block_table_indices}, num_save_token_rank:{num_save_tokens_rank}, position for slot:{positions_for_slot},"
                             f"block_offsets:{block_offsets}, slot_mapping:{slot_mapping}, kv_save_start:{kv_save_start}, start_index:{start_index}, num_save_tokens_rank:{num_save_tokens_rank}")
 
                 # Dump debug info to pickle file (include step info)
@@ -1201,7 +1215,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 import os
                 # 使用prev作为step标识，因为每个chunk的prev不同
                 step_id = 0
-                dump_file = f"gt_debug_slot_mapping_cp{self.cp_rank}_sp{self.sp_rank}_req{i}_step{step_id}.pkl"
+                dump_file = f"gt_debug_slot_mapping_cp{cp_rank}_sp{sp_rank}_req{i}_step{step_id}.pkl"
                 if not os.path.exists(dump_file):
                     # Helper function to convert tensor/array to numpy
                     def to_numpy(x):
@@ -1238,6 +1252,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     ):
         block_table_cpu = self.input_batch.block_table[0].get_cpu_tensor()
         num_computed_and_new_tokens_batch = self.input_batch.num_computed_tokens_of_cp_sp
+        num_computed_and_new_tokens_batch_single = np.array(
+            self.input_batch.num_computed_tokens_of_cp_sp_single[:self.input_batch.num_reqs])
+        num_computed_and_new_tokens_batch_current = np.array(
+            self.input_batch.num_computed_tokens_of_cp_sp_current[:self.input_batch.num_reqs])
         self.cp_rank = get_context_model_parallel_rank()
         self.sp_rank = get_tensor_model_parallel_rank()
         start_index = 0
@@ -1247,7 +1265,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             if self.input_batch.kv_rank[i] == (self.cp_rank, self.sp_rank):
                 block_table_req = block_table_cpu[i]
                 block_table_indices = np.repeat(block_table_req, self.block_size)
-                num_save_tokens_rank = num_computed_and_new_tokens_batch[i][self.cp_rank][self.sp_rank]
+                #num_save_tokens_rank = num_computed_and_new_tokens_batch[i][self.cp_rank][self.sp_rank]
+                num_save_tokens_rank = num_computed_and_new_tokens_batch_single[i][self.cp_rank][self.sp_rank]
 
                 positions_for_slot = self.arange_np[:num_save_tokens_rank]
                 block_offsets = positions_for_slot % self.block_size
@@ -1284,7 +1303,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                         'block_table_indices': to_numpy(block_table_indices),
                         'block_size': self.block_size,
                         'start_index': start_index,
-                        'slot_mapping_np':self.slot_mapping_np
+                        'slot_mapping_np':self.slot_mapping_np,
+                        'num_computed_tokens_single':num_computed_and_new_tokens_batch_single,
+                        'num_computed_tokens_all':num_computed_and_new_tokens_batch,
+                        'num_computed_tokens_current':num_computed_and_new_tokens_batch_current,
                     }
                     with open(dump_file, 'wb') as f:
                         pickle.dump(debug_data, f)
@@ -1577,6 +1599,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_actual_tokens_cp_full=num_actual_tokens_cp_full,
                 num_computed_tokens_of_cp_sp=self.input_batch.num_computed_tokens_of_cp_sp[:self.input_batch.num_reqs],
                 num_computed_tokens_of_cp_sp_single=self.input_batch.num_computed_tokens_of_cp_sp_single[:self.input_batch.num_reqs],
+                num_computed_tokens_of_cp_sp_current=self.input_batch.num_computed_tokens_of_cp_sp_current[:self.input_batch.num_reqs],
                 q_head_idx_tensor=self.q_head_idx_tensor,
                 q_tail_idx_tensor=self.q_tail_idx_tensor,
                 q_full_idx=self.q_full_idx,
@@ -1593,7 +1616,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             long_seq_metadata = AscendCommonLongSequenceMetadata(
                 num_actual_tokens_cp_full=num_actual_tokens_cp_full,
                 num_computed_tokens_of_cp_sp=self.input_batch.num_computed_tokens_of_cp_sp[:self.input_batch.num_reqs],
-                num_computed_tokens_of_cp_sp_single=self.input_batch.num_computed_tokens_of_cp_sp_single[:self.input_batch.num_reqs]
+                num_computed_tokens_of_cp_sp_single=self.input_batch.num_computed_tokens_of_cp_sp_single[:self.input_batch.num_reqs],
+                num_computed_tokens_of_cp_sp_current=self.input_batch.num_computed_tokens_of_cp_sp_current[:self.input_batch.num_reqs]
             )
 
         self.query_start_loc_np[0] = 0

@@ -172,6 +172,7 @@ class AscendScheduler(Scheduler):
                     request.num_computed_tokens_of_cp_sp = [[0] * self.sp_size for _ in range(self.cp_size)]
                     # 初始化单独累加的token数（如果是第一次）
                     request.num_computed_tokens_of_cp_sp_single = [[0] * self.sp_size for _ in range(self.cp_size)]
+                    request.num_computed_tokens_of_cp_sp_current = [[0] * self.sp_size for _ in range(self.cp_size)]
                     for i in range(self.cp_size):
                         for j in range(self.sp_size):
                             length = int(num_blocks_of_cp_sp[i][j]) * self.block_size
@@ -179,6 +180,7 @@ class AscendScheduler(Scheduler):
                             request.num_computed_tokens_of_cp_sp[i][j] = len(request.token_ids_of_cp_sp[i][j]) + num_computed_tokens
                             # 只累加该rank自己的token数
                             request.num_computed_tokens_of_cp_sp_single[i][j] += len(request.token_ids_of_cp_sp[i][j])
+                            request.num_computed_tokens_of_cp_sp_current[i][j] = len(request.token_ids_of_cp_sp[i][j])
                             logger.info(f"cp:{i},sp{j}, num_computed_tokens_of_cp_sp_single:{request.num_computed_tokens_of_cp_sp_single[i][j]}, request.num_computed_tokens_of_cp_sp[i][j]:{request.num_computed_tokens_of_cp_sp[i][j]}")
                             start_id += length
                     logger.info(
@@ -200,12 +202,14 @@ class AscendScheduler(Scheduler):
                     # 初始化单独累加的token数
                     if not hasattr(request, 'num_computed_tokens_of_cp_sp_single') or request.num_computed_tokens_of_cp_sp_single is None:
                         request.num_computed_tokens_of_cp_sp_single = [[0] * self.sp_size for _ in range(self.cp_size)]
+                    if not hasattr(request, 'num_computed_tokens_of_cp_sp_current') or request.num_computed_tokens_of_cp_sp_current is None:
+                        request.num_computed_tokens_of_cp_sp_current = [[0] * self.sp_size for _ in range(self.cp_size)]
                     for i in range(self.cp_size):
                         for j in range(self.sp_size):
                             request.token_ids_of_cp_sp[i][j] = request.all_token_ids[start_id:start_id + request.num_blocks_of_cp_sp[i][j] * self.block_size]
                             request.num_computed_tokens_of_cp_sp[i][j] = len(request.token_ids_of_cp_sp[i][j]) + num_computed_tokens
-                            # 非chunked模式下，单独累加数等于总数
                             request.num_computed_tokens_of_cp_sp_single[i][j] = len(request.token_ids_of_cp_sp[i][j])
+                            request.num_computed_tokens_of_cp_sp_current[i][j] = len(request.token_ids_of_cp_sp[i][j])
                             start_id += request.num_blocks_of_cp_sp[i][j] * self.block_size
                             logger.info(f"cp:{i},sp{j}, num_computed_tokens_of_cp_sp_single:{request.num_computed_tokens_of_cp_sp_single[i][j]}, request.num_computed_tokens_of_cp_sp[i][j]:{request.num_computed_tokens_of_cp_sp[i][j]}")
                    
@@ -214,6 +218,7 @@ class AscendScheduler(Scheduler):
                 # 使用单一的 cp=1, sp=1 维度来模拟原有行为
                 request.num_computed_tokens_of_cp_sp = [[num_computed_tokens]]
                 request.num_computed_tokens_of_cp_sp_single = [[0]]  # 初始化为0
+                request.num_computed_tokens_of_cp_sp_current = [[0]]  # 初始化为0
                 request.token_ids_of_cp_sp = [[[]]]
                 request.num_blocks_of_cp_sp = np.array([[0]])
 
@@ -382,6 +387,8 @@ class AscendScheduler(Scheduler):
                     # 初始化单独累加的token数（如果是第一次）
                     if not hasattr(request, 'num_computed_tokens_of_cp_sp_single') or request.num_computed_tokens_of_cp_sp_single is None:
                         request.num_computed_tokens_of_cp_sp_single = [[0] * self.sp_size for _ in range(self.cp_size)]
+                    if not hasattr(request, 'num_computed_tokens_of_cp_sp_current') or request.num_computed_tokens_of_cp_sp_current is None:
+                        request.num_computed_tokens_of_cp_sp_current = [[0] * self.sp_size for _ in range(self.cp_size)]
                     for i in range(self.cp_size):
                         for j in range(self.sp_size):
                             length = int(num_blocks_of_cp_sp[i][j]) * self.block_size
@@ -389,6 +396,7 @@ class AscendScheduler(Scheduler):
                             request.num_computed_tokens_of_cp_sp[i][j] = len(request.token_ids_of_cp_sp[i][j]) + num_computed_tokens
                             # 只累加该rank自己的token数
                             request.num_computed_tokens_of_cp_sp_single[i][j] += len(request.token_ids_of_cp_sp[i][j])
+                            request.num_computed_tokens_of_cp_sp_current[i][j] = len(request.token_ids_of_cp_sp[i][j])
                             logger.info(f"cp:{i},sp{j}, num_computed_tokens_of_cp_sp_single:{request.num_computed_tokens_of_cp_sp_single[i][j]}, request.num_computed_tokens_of_cp_sp[i][j]:{request.num_computed_tokens_of_cp_sp[i][j]}")
                             start_id += length
                     logger.info(
@@ -400,7 +408,10 @@ class AscendScheduler(Scheduler):
                     request.num_computed_tokens_of_cp_sp = [[request.num_computed_tokens + num_new_tokens]]
                     if not hasattr(request, 'num_computed_tokens_of_cp_sp_single') or request.num_computed_tokens_of_cp_sp_single is None:
                         request.num_computed_tokens_of_cp_sp_single = [[0]]
+                    if not hasattr(request, 'num_computed_tokens_of_cp_sp_current') or request.num_computed_tokens_of_cp_sp_current is None:
+                        request.num_computed_tokens_of_cp_sp_current = [[0]]
                     request.num_computed_tokens_of_cp_sp_single[0][0] += num_new_tokens
+                    request.num_computed_tokens_of_cp_sp_current[0][0] = num_new_tokens
 
                 # 分配 KV slots
                 while True:
@@ -558,6 +569,8 @@ class AscendScheduler(Scheduler):
                 num_scheduled_tokens[request.request_id] = num_new_tokens
                 if self.cp_size * self.sp_size > 1:
                     request.num_computed_tokens_of_cp_sp[kv_rank[0]][kv_rank[1]] += num_new_tokens
+                    request.num_computed_tokens_of_cp_sp_single[kv_rank[0]][kv_rank[1]] += num_new_tokens
+                    request.num_computed_tokens_of_cp_sp_current[kv_rank[0]][kv_rank[1]] = num_new_tokens
                     logger.info(f"!!!request.num_computed_tokens_of_cp_sp[kv_rank[0]][kv_rank[1]] = {request.num_computed_tokens_of_cp_sp[kv_rank[0]][kv_rank[1]]}, num_new_tokens:{num_new_tokens}")
                 token_budget -= num_new_tokens
                 req_index += 1

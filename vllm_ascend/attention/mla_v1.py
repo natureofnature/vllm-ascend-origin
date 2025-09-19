@@ -126,6 +126,7 @@ class AscendMLADecodeMetadata:
     cos: torch.Tensor = None
     num_computed_tokens_of_cp_sp: list[list[list[int]]] = None
     num_computed_tokens_of_cp_sp_single: list[list[list[int]]] = None
+    num_computed_tokens_of_cp_sp_current: list[list[list[int]]] = None
 
 
 @dataclass
@@ -307,6 +308,7 @@ class AscendMLAMetadataBuilder:
         num_actual_tokens_cp_full = long_seq_metadata.num_actual_tokens_cp_full if long_seq_metadata else None
         num_computed_tokens_of_cp_sp = long_seq_metadata.num_computed_tokens_of_cp_sp if long_seq_metadata else None
         num_computed_tokens_of_cp_sp_single = long_seq_metadata.num_computed_tokens_of_cp_sp_single if long_seq_metadata else None
+        num_computed_tokens_of_cp_sp_current = long_seq_metadata.num_computed_tokens_of_cp_sp_current if long_seq_metadata else None
         q_head_idx_tensor = long_seq_metadata.q_head_idx_tensor if long_seq_metadata else None
         q_tail_idx_tensor = long_seq_metadata.q_tail_idx_tensor if long_seq_metadata else None
         kv_with_q_head_nomask_idx_tensor = long_seq_metadata.kv_with_q_head_nomask_idx_tensor if long_seq_metadata else None
@@ -459,6 +461,7 @@ class AscendMLAMetadataBuilder:
                 cos=cos,
                 num_computed_tokens_of_cp_sp=num_computed_tokens_of_cp_sp,
                 num_computed_tokens_of_cp_sp_single=num_computed_tokens_of_cp_sp_single,
+                num_computed_tokens_of_cp_sp_current=num_computed_tokens_of_cp_sp_current,
             )
 
         return self.metadata_cls(  # type: ignore
@@ -1564,6 +1567,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 decode_qc_0 = decode_q_c.detach().cpu().to(torch.float32)
                 decode_q_wo_k_up_0 = decode_q_wo_k_up.detach().cpu().to(torch.float32)
                 decode_q_wo_k_up_pe_0 = decode_q_wo_k_up_pe.detach().cpu().to(torch.float32)
+                decode_slot_mapping = attn_metadata.slot_mapping.detach().cpu().to(torch.int32)
                 #decode_q_pe_0 = decode_q_pe.detach().cpu().to(torch.float32)
                 self._maybe_dump_pickle(
                     tag="attn_decode_slot_mapping",
@@ -1576,6 +1580,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                         "decode_qc":decode_qc_0.numpy(),
                         "decode_q_wo_k_up":decode_q_wo_k_up_0.numpy(),
                         "decode_q_wo_k_up_pe":decode_q_wo_k_up_pe_0.numpy(),
+                        "decode_slot_mapping":decode_slot_mapping,
                         #"decode_q_pe":decode_q_pe_0.numpy()
                     },
                     step=_dump_step,
@@ -1764,14 +1769,23 @@ class AscendMLAImpl(MLAAttentionImpl):
         # use cp & sp splited computed token nums from scheduler to compute actual seq_len and seq_mask
         num_computed_tokens_of_cp_sp = np.array(decode_metadata.num_computed_tokens_of_cp_sp) # [bs, cp_size, sp_size]
         num_computed_tokens_of_cp_sp_single = np.array(decode_metadata.num_computed_tokens_of_cp_sp_single) # [bs, cp_size, sp_size]
-        seq_mask_cp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp.sum(2)) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
-        seq_mask_sp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp[:, self.cp_rank, :]) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
-        #seq_len = num_computed_tokens_of_cp_sp[:, self.cp_rank, self.sp_rank]
-        # for chunked prefill compatible
-        seq_len = num_computed_tokens_of_cp_sp_single[:, self.cp_rank, self.sp_rank]
+        num_computed_tokens_of_cp_sp_current = np.array(decode_metadata.num_computed_tokens_of_cp_sp_current) # [bs, cp_size, sp_size]
+
+        chunked_prefill = True
+        if chunked_prefill:
+            seq_mask_cp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp_single.sum(2)) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
+            seq_mask_sp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp_single[:, self.cp_rank, :]) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
+            seq_len = num_computed_tokens_of_cp_sp_single[:, self.cp_rank, self.sp_rank]
+        else:
+            seq_mask_cp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp.sum(2)) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
+            seq_mask_sp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp[:, self.cp_rank, :]) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
+            seq_len = num_computed_tokens_of_cp_sp[:, self.cp_rank, self.sp_rank]
+
+        # ---for chunked prefill compatible---
 
         seq_len = torch.tensor(seq_len, dtype=torch.int32)
         batch_size = seq_len.size(0)
+        seq_starts = torch.zeros([batch_size], dtype=torch.int32).to(q_nope.device)
 
         if torch.sum(seq_len).item() == 0:
             # Case that no kv_cache has been stored on this rank, no need to do following computation.
@@ -1814,7 +1828,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             seq_len_kv = seq_len
             seq_len_all = torch.stack([seq_len_q, seq_len_kv])
 
-            if self._dump_enabled() and self._decode_step_idx < 1:
+            if self._dump_enabled():
                 _dump_step = self._decode_step_idx
                 prefill_q_nope_0 = q_nope.detach().cpu().to(torch.float32)
                 prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
@@ -1833,6 +1847,11 @@ class AscendMLAImpl(MLAAttentionImpl):
                         "prefill_k_nope": prefill_k_nope_0.numpy(),
                         "prefill_k_pe": prefill_k_pe_0.numpy(),
                         "prefill_value": prefill_value_0.numpy(),
+                        "seq_len":seq_len,
+                        "seq_starts":seq_starts,
+                        "num_computed_tokens_of_cp_sp":num_computed_tokens_of_cp_sp,
+                        "num_computed_tokens_of_cp_sp_single":num_computed_tokens_of_cp_sp_single,
+                        "num_computed_tokens_of_cp_sp_current":num_computed_tokens_of_cp_sp_current,
                         #"kv_c_and_k_pe_cache_0":kv_c_and_k_pe_cache_0.numpy(),
                         #"kv_c_and_k_pe_cache_1":kv_c_and_k_pe_cache_1.numpy(),
                     },
@@ -1858,7 +1877,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
             logger.info(f"cp{self.cp_rank},sp{self.sp_rank},decode step:{self._decode_step_idx},seqlen:{seq_len_all}")
             # attn_output: [bs, num_heads_full(16), v_head_dim(128)], softmax_lse: [num_heads_full(16), bs]
-            if self._dump_enabled() and self._decode_step_idx < 1:
+            if self._dump_enabled():
                 _dump_step = self._decode_step_idx
                 prefill_q_nope_0 = q_nope.detach().cpu().to(torch.float32)
                 prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
@@ -1869,6 +1888,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 seqlen_1 = seq_len_all[1].detach().cpu().to(torch.int32),
                 attn_output_0 = attn_output.detach().cpu().to(torch.float32),
                 softmax_lse_0 = softmax_lse.detach().cpu().to(torch.float32),
+                seq_mask_sp_0 = seq_mask_sp.detach().cpu().to(torch.float32),
+                seq_mask_cp_0 = seq_mask_cp.detach().cpu().to(torch.float32),
                 #kv_c_and_k_pe_cache_0 = kv_c_and_k_pe_cache[0].detach().cpu().to(torch.float32)
                 #kv_c_and_k_pe_cache_1 = kv_c_and_k_pe_cache[1].detach().cpu().to(torch.float32)
                 self._maybe_dump_pickle(
@@ -1885,6 +1906,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                         "seqlen_all_1":seqlen_1,
                         "attn_output": attn_output_0,
                         "softmax_lse": softmax_lse_0,
+                        "seq_mask_sp": seq_mask_sp_0,
+                        "seq_mask_cp": seq_mask_cp_0,
                         #"kv_c_and_k_pe_cache_0":kv_c_and_k_pe_cache_0.numpy(),
                         #"kv_c_and_k_pe_cache_1":kv_c_and_k_pe_cache_1.numpy(),
                     },
@@ -1964,6 +1987,24 @@ class AscendMLAImpl(MLAAttentionImpl):
         attn_output = attn_output.reshape([num_tokens, self.num_heads * self.v_head_dim]).to(torch.bfloat16)
         # out = self.o_proj(attn_output, is_prefill=False)[0]
         out = attn_output
+
+        
+        if self._dump_enabled():
+            _dump_step = self._decode_step_idx
+            attn_forward_out = out.detach().cpu().to(torch.float32),
+            #kv_c_and_k_pe_cache_0 = kv_c_and_k_pe_cache[0].detach().cpu().to(torch.float32)
+            #kv_c_and_k_pe_cache_1 = kv_c_and_k_pe_cache[1].detach().cpu().to(torch.float32)
+            self._maybe_dump_pickle(
+                tag="kv_decode_after_mla_final",
+                payload={
+                    "layer_id": self.layer_id,
+                    "cp_rank": int(self.cp_rank),
+                    "attn_forward_out":attn_forward_out,
+                    #"kv_c_and_k_pe_cache_0":kv_c_and_k_pe_cache_0.numpy(),
+                    #"kv_c_and_k_pe_cache_1":kv_c_and_k_pe_cache_1.numpy(),
+                },
+                step=_dump_step,
+            )
         return out
 
     def forward(
