@@ -1576,6 +1576,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 cp_kv_recover_idx=self.cp_kv_recover_idx,
                 num_actual_tokens_cp_full=num_actual_tokens_cp_full,
                 num_computed_tokens_of_cp_sp=self.input_batch.num_computed_tokens_of_cp_sp[:self.input_batch.num_reqs],
+                num_computed_tokens_of_cp_sp_single=self.input_batch.num_computed_tokens_of_cp_sp_single[:self.input_batch.num_reqs],
                 q_head_idx_tensor=self.q_head_idx_tensor,
                 q_tail_idx_tensor=self.q_tail_idx_tensor,
                 q_full_idx=self.q_full_idx,
@@ -1591,7 +1592,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         else:
             long_seq_metadata = AscendCommonLongSequenceMetadata(
                 num_actual_tokens_cp_full=num_actual_tokens_cp_full,
-                num_computed_tokens_of_cp_sp=self.input_batch.num_computed_tokens_of_cp_sp[:self.input_batch.num_reqs]
+                num_computed_tokens_of_cp_sp=self.input_batch.num_computed_tokens_of_cp_sp[:self.input_batch.num_reqs],
+                num_computed_tokens_of_cp_sp_single=self.input_batch.num_computed_tokens_of_cp_sp_single[:self.input_batch.num_reqs]
             )
 
         self.query_start_loc_np[0] = 0

@@ -125,6 +125,7 @@ class AscendMLADecodeMetadata:
     sin: torch.Tensor = None
     cos: torch.Tensor = None
     num_computed_tokens_of_cp_sp: list[list[list[int]]] = None
+    num_computed_tokens_of_cp_sp_single: list[list[list[int]]] = None
 
 
 @dataclass
@@ -305,6 +306,7 @@ class AscendMLAMetadataBuilder:
         cp_kv_recover_idx = long_seq_metadata.cp_kv_recover_idx if long_seq_metadata else None
         num_actual_tokens_cp_full = long_seq_metadata.num_actual_tokens_cp_full if long_seq_metadata else None
         num_computed_tokens_of_cp_sp = long_seq_metadata.num_computed_tokens_of_cp_sp if long_seq_metadata else None
+        num_computed_tokens_of_cp_sp_single = long_seq_metadata.num_computed_tokens_of_cp_sp_single if long_seq_metadata else None
         q_head_idx_tensor = long_seq_metadata.q_head_idx_tensor if long_seq_metadata else None
         q_tail_idx_tensor = long_seq_metadata.q_tail_idx_tensor if long_seq_metadata else None
         kv_with_q_head_nomask_idx_tensor = long_seq_metadata.kv_with_q_head_nomask_idx_tensor if long_seq_metadata else None
@@ -456,6 +458,7 @@ class AscendMLAMetadataBuilder:
                 sin=sin,
                 cos=cos,
                 num_computed_tokens_of_cp_sp=num_computed_tokens_of_cp_sp,
+                num_computed_tokens_of_cp_sp_single=num_computed_tokens_of_cp_sp_single,
             )
 
         return self.metadata_cls(  # type: ignore
@@ -1760,9 +1763,12 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         # use cp & sp splited computed token nums from scheduler to compute actual seq_len and seq_mask
         num_computed_tokens_of_cp_sp = np.array(decode_metadata.num_computed_tokens_of_cp_sp) # [bs, cp_size, sp_size]
+        num_computed_tokens_of_cp_sp_single = np.array(decode_metadata.num_computed_tokens_of_cp_sp_single) # [bs, cp_size, sp_size]
         seq_mask_cp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp.sum(2)) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
         seq_mask_sp = torch.where(torch.tensor(num_computed_tokens_of_cp_sp[:, self.cp_rank, :]) == 0, 0, 1).to(torch.uint8).to(q_pe.device)
-        seq_len = num_computed_tokens_of_cp_sp[:, self.cp_rank, self.sp_rank]
+        #seq_len = num_computed_tokens_of_cp_sp[:, self.cp_rank, self.sp_rank]
+        # for chunked prefill compatible
+        seq_len = num_computed_tokens_of_cp_sp_single[:, self.cp_rank, self.sp_rank]
 
         seq_len = torch.tensor(seq_len, dtype=torch.int32)
         batch_size = seq_len.size(0)
