@@ -67,6 +67,8 @@ class CachedRequestState:
     # cp param
     kv_rank: Optional[tuple[int]] = None
     num_computed_tokens_of_cp_sp: Optional[list[list[int]]] = None
+    num_computed_tokens_of_cp_sp_single: Optional[list[list[int]]] = None  # 只累加该rank自己的token数
+    num_computed_tokens_of_cp_sp_current: Optional[list[list[int]]] = None  # 只记录当前chunk，该rank自己的token数
 
     def __post_init__(self):
         self.num_prompt_tokens = len(self.prompt_token_ids)
@@ -273,6 +275,8 @@ class InputBatch:
         # cp param
         self.kv_rank: list[tuple[int]] = [None] * max_num_reqs
         self.num_computed_tokens_of_cp_sp: list[list[list[int]]] = [None] * max_num_reqs
+        self.num_computed_tokens_of_cp_sp_single: list[list[list[int]]] = [None] * max_num_reqs
+        self.num_computed_tokens_of_cp_sp_current: list[list[list[int]]] = [None] * max_num_reqs
 
     @property
     def req_ids(self) -> list[str]:
@@ -323,6 +327,8 @@ class InputBatch:
         # cp param
         self.kv_rank[req_index] = request.kv_rank
         self.num_computed_tokens_of_cp_sp[req_index] = request.num_computed_tokens_of_cp_sp
+        self.num_computed_tokens_of_cp_sp_single[req_index] = request.num_computed_tokens_of_cp_sp_single
+        self.num_computed_tokens_of_cp_sp_current[req_index] = request.num_computed_tokens_of_cp_sp_current
 
         # Copy the prompt token ids and output token ids.
         num_prompt_tokens = len(request.prompt_token_ids)

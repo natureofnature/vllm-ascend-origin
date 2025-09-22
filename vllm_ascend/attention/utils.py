@@ -12,6 +12,10 @@ class AscendCommonLongSequenceMetadata:
 
     num_computed_tokens_of_cp_sp: list[list[list[int]]] = None
 
+    num_computed_tokens_of_cp_sp_single: list[list[list[int]]] = None
+
+    num_computed_tokens_of_cp_sp_current: list[list[list[int]]] = None
+
     q_head_idx_tensor: torch.Tensor = None
 
     q_tail_idx_tensor: torch.Tensor = None
