@@ -1611,7 +1611,15 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.num_accepted_tokens.copy_to_gpu()
 
         # prepare cp meta data
-        long_seq_metadata = self._generate_cp_metadata(total_num_scheduled_tokens, seq_lens_cpu, scheduler_output)
+        # For chunked prefill, use num_scheduled_tokens instead of cumulative seq_lens
+        # to correctly calculate chunk_len in _generate_cp_metadata
+        if self.vllm_config.scheduler_config.chunked_prefill_enabled and self.cp_size > 1:
+            # In chunked prefill, seq_lens_for_cp should be the current chunk size
+            seq_lens_for_cp = torch.from_numpy(num_scheduled_tokens[:num_reqs])
+        else:
+            # Normal mode: use cumulative sequence lengths
+            seq_lens_for_cp = seq_lens_cpu
+        long_seq_metadata = self._generate_cp_metadata(total_num_scheduled_tokens, seq_lens_for_cp, scheduler_output)
         original_total_num_scheduled_tokens = sum(original_num_scheduled_tokens[:num_reqs])
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -3681,7 +3689,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     def _num_scheduled_tokens_prefill_cp(self, num_tokens,
                                          num_computed_tokens,
                                          cp_kv_recover_idx):
-        num_scheduled_tokens = num_tokens - num_computed_tokens
+        # IMPORTANT: num_tokens from scheduler_output.num_scheduled_tokens is already
+        # the number of NEW tokens to schedule in this chunk (not cumulative).
+        # In chunked prefill, it's the chunk size, NOT total tokens.
+        num_scheduled_tokens = num_tokens
         num_cp_padded_scheduled_tokens = cdiv(
             num_scheduled_tokens, 2 * self.cp_size) * (2 * self.cp_size
                                                        )  # pad to 2*cp_size
@@ -3702,7 +3713,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                     self.cp_rank * chunk_size])
 
         # used to recover kv order in cp prefill (after all-gather kv and before storing kv_cache)
-        num_added_recover_tokens = len(cp_kv_recover_idx[0]) * self.cp_size
+        # For chunked prefill: use batch-level accumulated offset from cp_kv_recover_idx
+        # PLUS request-level offset from num_computed_tokens (tokens already processed in previous chunks)
+        num_added_recover_tokens = len(cp_kv_recover_idx[0]) * self.cp_size + num_computed_tokens
         for rank in range(self.cp_size):
             cp_kv_recover_idx[rank].extend(
                 full_indices[rank * chunk_size +
@@ -3728,15 +3741,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         for i, req_id in enumerate(self.input_batch.req_ids):
             num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            num_computed_tokens = self.input_batch.num_computed_tokens_cpu[i]
             is_prefill = num_tokens > 1
             if is_prefill:
                 # when cp > 1 & prefill, need to pad & split sequence here
                 req_position_cp, num_cp_padded_scheduled_tokens, self.num_cp_pads[
                     i] = self._num_scheduled_tokens_prefill_cp(
                     num_tokens,
-                    self.input_batch.num_computed_tokens_cpu[i],
+                    num_computed_tokens,
                     self.cp_kv_recover_idx)
                 num_tokens = len(req_position_cp)
+                logger.info(f"==> update tokens for cp, {num_tokens=},{self.input_batch.num_computed_tokens_cpu[i]=}")
                 self.position_cp[start_index:start_index +
                                              num_tokens] = req_position_cp
                 start_index += num_tokens
@@ -3770,6 +3785,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             cp_kv_recover_idx = torch.zeros(num_actual_tokens_cp_full,
                                             dtype=torch.int32,
                                             device=self.device)
+            logger.info(f"====>{self.cp_kv_recover_idx=}")
             cp_kv_recover_idx.copy_(torch.tensor(
                 np.array(self.cp_kv_recover_idx).flatten().tolist()),
                 non_blocking=True)
