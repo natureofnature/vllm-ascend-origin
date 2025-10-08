@@ -816,12 +816,20 @@ class AscendMLAImpl(MLAAttentionImpl):
                 # DCP mode: first all_gather within DCP group, let each rank in CP group share complete sequence blocks
                 # Step 1: DCP all_gather latent
                 kv_c_k_pe_local = torch.cat([kv_c_normed, k_pe.squeeze()], dim=-1)  # [local_toks, latent_dim + rope_dim]
-
-                kv_c_k_pe_gather_list = [torch.empty_like(kv_c_k_pe_local) for _ in range(self.dcp_size)]
-                dist.all_gather(kv_c_k_pe_gather_list, kv_c_k_pe_local, group=self.dcp_group)
-
-                # Step 2: concatenate all DCP ranks' data in sequence dimension
-                kv_c_k_pe_full = torch.cat(kv_c_k_pe_gather_list, dim=0)  # [total_dcp_toks, latent_dim + rope_dim]
+                
+                # Step 2: use all_gather_into_tensor_uneven (gather + cat)
+                output_split_sizes = num_computed_tokens_of_cp_sp_accum[req_idx][i][self.cp_rank]       # need to know num tokens of each rank in dcp group before using all_gather_into_tensor_uneven
+                total_toks = sum(output_split_sizes)
+                latent_rope_dim = kv_c_k_pe_local.size(-1)
+                kv_c_k_pe_full = torch.empty((total_toks, latent_rope_dim), device=kv_c_k_pe_local.device, dtype=kv_c_k_pe_local.dtype)
+                
+                torch_npu.distributed.all_gather_into_tensor_uneven(
+                    kv_c_k_pe_full,
+                    kv_c_k_pe_local,
+                    output_split_sizes=output_split_sizes,
+                    group=self.dcp_group,
+                    async_op=False
+                )
 
                 kv_c_normed_full, k_pe_full = torch.split(kv_c_k_pe_full, [latent_kv_dim, rope_dim], dim=-1)
 
@@ -839,12 +847,15 @@ class AscendMLAImpl(MLAAttentionImpl):
             
             if self.cp_size * self.dcp_size > 1:
                 # CP+DCP mode: first compute this rank's contribution to the chunk
-                block_out_local = torch.empty(
-                    num_tokens_all, self.num_heads, self.v_head_dim,
-                    dtype=q_nope.dtype, device=q_nope.device)
-                block_lse_local = torch.empty(
-                    self.num_heads, num_tokens_all,
-                    dtype=torch.float32, device=q_nope.device)
+                # Case that no kv_cache has been stored on this rank, no need to do following computation.
+                block_out_local = torch.zeros(
+                    [num_tokens_all, self.num_heads, self.v_head_dim],
+                    dtype=q_nope.dtype,
+                    device=q_nope.device)
+                block_lse_local = torch.full((self.num_heads, num_tokens_all),
+                                            float('-inf'),
+                                            dtype=torch.float32,
+                                            device=q_nope.device)
                 logger.info(f"--->here---,cp={self.cp_rank},dcp={self.dcp_rank}, cache_kv_c.shape:{cache_kv_c.shape},cache_k_pe.shape:{cache_k_pe.shape}, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
                             f"value:{v.shape}, seq_len:{seq_len.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
                             f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
@@ -873,23 +884,24 @@ class AscendMLAImpl(MLAAttentionImpl):
                 #         step=_dump_step,
                 #     )
 
-                torch_npu.atb.npu_ring_mla(
-                    q_nope=q_nope,
-                    q_rope=q_pe,
-                    k_nope=k_nope,
-                    k_rope=k_pe,
-                    value=v,
-                    mask=mask_local,
-                    seqlen=seq_len,
-                    head_num=self.num_heads,
-                    kv_head_num=self.num_heads,
-                    qk_scale=self.scale,
-                    kernel_type="kernel_type_high_precision",
-                    mask_type="no_mask",
-                    input_layout="type_bsnd",
-                    calc_type="calc_type_first_ring",
-                    output=block_out_local,
-                    softmax_lse=block_lse_local)
+                if seq_len2.item() > 0:
+                    torch_npu.atb.npu_ring_mla(
+                        q_nope=q_nope,
+                        q_rope=q_pe,
+                        k_nope=k_nope,
+                        k_rope=k_pe,
+                        value=v,
+                        mask=mask_local,
+                        seqlen=seq_len,
+                        head_num=self.num_heads,
+                        kv_head_num=self.num_heads,
+                        qk_scale=self.scale,
+                        kernel_type="kernel_type_high_precision",
+                        mask_type="no_mask",
+                        input_layout="type_bsnd",
+                        calc_type="calc_type_first_ring",
+                        output=block_out_local,
+                        softmax_lse=block_lse_local)
 
                 # CP dimension fusion (SP already handled above)
                 logger.debug(f"block_out_local shape:{block_out_local.shape}, block_lse_local shape:{block_lse_local.shape}")
