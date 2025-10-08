@@ -3679,9 +3679,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         return False
 
     def _num_scheduled_tokens_prefill_cp(self, num_tokens,
-                                         num_computed_tokens,
                                          cp_kv_recover_idx):
-        num_scheduled_tokens = num_tokens - num_computed_tokens
+        # IMPORTANT: num_tokens from scheduler_output.num_scheduled_tokens is already
+        # the number of NEW tokens to schedule in this chunk (not cumulative).
+        # In chunked prefill, it's the chunk size, NOT total tokens.
+        num_scheduled_tokens = num_tokens
         num_cp_padded_scheduled_tokens = cdiv(
             num_scheduled_tokens, 2 * self.cp_size) * (2 * self.cp_size
                                                        )  # pad to 2*cp_size
@@ -3734,9 +3736,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 req_position_cp, num_cp_padded_scheduled_tokens, self.num_cp_pads[
                     i] = self._num_scheduled_tokens_prefill_cp(
                     num_tokens,
-                    self.input_batch.num_computed_tokens_cpu[i],
                     self.cp_kv_recover_idx)
                 num_tokens = len(req_position_cp)
+                logger.info(f"==> update tokens for cp, {num_tokens=},{self.input_batch.num_computed_tokens_cpu[i]=}")
                 self.position_cp[start_index:start_index +
                                              num_tokens] = req_position_cp
                 start_index += num_tokens
@@ -3770,6 +3772,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             cp_kv_recover_idx = torch.zeros(num_actual_tokens_cp_full,
                                             dtype=torch.int32,
                                             device=self.device)
+            logger.info(f"====>{self.cp_kv_recover_idx=}")
             cp_kv_recover_idx.copy_(torch.tensor(
                 np.array(self.cp_kv_recover_idx).flatten().tolist()),
                 non_blocking=True)
