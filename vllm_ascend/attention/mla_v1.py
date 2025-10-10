@@ -847,7 +847,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
                 k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
             
-            if self.cp_size * self.dcp_size > 1:
+            if self.cp_size > 1:
                 # CP+DCP mode: first compute this rank's contribution to the chunk
                 # Case that no kv_cache has been stored on this rank, no need to do following computation.
                 block_out_local = torch.zeros(
@@ -919,12 +919,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 for r in range(self.cp_size):
                     out_lse_r = out_lse_list[r]
                     out_r, lse_r = torch.split(out_lse_r, [self.v_head_dim, 1], dim=-1)
-                    # DCP mode: each rank processed the full DCP sequence, use simplified mask
-                    if self.dcp_size > 1:
-                        token_mask = torch.ones([out_r.size(0)], dtype=torch.uint8, device=out_r.device)
-                    else:
-                        # Non-DCP mode uses original logic
-                        token_mask = torch.ones([out_r.size(0)], dtype=torch.uint8, device=out_r.device)
+                    token_mask = torch.ones([out_r.size(0)], dtype=torch.uint8, device=out_r.device)
                     chunk_out_g, chunk_lse_g = self._update_out_and_lse(
                         chunk_out_g, chunk_lse_g, out_r, lse_r, token_mask)
                 
@@ -959,13 +954,11 @@ class AscendMLAImpl(MLAAttentionImpl):
                     seqlen=seq_len,
                     head_num=self.num_heads,
                     kv_head_num=self.num_heads,
-                    pre_out=None,
-                    prev_lse=None,
                     qk_scale=self.scale,
                     kernel_type="kernel_type_high_precision",
                     mask_type="no_mask",
                     input_layout="type_bsnd",
-                    calc_type="calc_type_default",
+                    calc_type="calc_type_first_ring",
                     output=block_out_local2,
                     softmax_lse=block_lse_local2)
                 block_lse_local_bt2 = block_lse_local2.permute(1, 0).unsqueeze(-1)
