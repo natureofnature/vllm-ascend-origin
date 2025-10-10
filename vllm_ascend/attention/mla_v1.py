@@ -23,7 +23,7 @@ from vllm.model_executor.layers.linear import (LinearBase,
 from vllm.utils import cdiv, round_down
 from vllm.v1.attention.backends.utils import AttentionCGSupport
 
-from vllm.logger import init_logger
+from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
@@ -37,7 +37,6 @@ from vllm_ascend.multistream.ms_split import model_input_split_v1_mla_attn
 from vllm_ascend.utils import npu_prefetch, context_parallel_enable
 from vllm_ascend.worker.npu_input_batch import InputBatch
 
-logger = init_logger(__name__)
 
 if context_parallel_enable():
     from vllm.distributed import (get_context_model_parallel_rank,
@@ -734,6 +733,9 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         # Keep the causal mask; do not override to all-ones.
         num_computed_tokens_of_cp_sp_accum = attn_metadata.prefill.num_computed_tokens_of_cp_sp_accum
+        logger.info(f"===> in chunked prefill ###, {num_computed_tokens_of_cp_sp_accum=}")
+        logger.info(f"===> in chunked prefill ===, {attn_metadata.prefill.num_computed_tokens_of_cp_sp=}")
+        logger.info(f"===> in chunked prefill +++, {attn_metadata.prefill.num_computed_tokens_of_cp_sp_single=}")
 
         for i in range(iters):
             if self.cp_size * self.dcp_size > 1:
@@ -1594,6 +1596,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         # use cp & sp split computed token nums from scheduler to compute actual seq_len and seq_mask
         num_computed_tokens_of_cp_sp = np.array(
             decode_meta.num_computed_tokens_of_cp_sp)  # [bs, cp_size, sp_size]
+        logger.info(f"===> in decode, {num_computed_tokens_of_cp_sp=}")
         seq_mask_cp = torch.where(
             torch.tensor(num_computed_tokens_of_cp_sp.sum(2)) == 0, 0,
             1).to(torch.uint8).to(q_pe.device)

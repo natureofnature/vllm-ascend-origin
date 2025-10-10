@@ -784,6 +784,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.input_batch.num_computed_tokens_of_cp_sp_single[req_index] = req_state.num_computed_tokens_of_cp_sp_single
             self.input_batch.num_computed_tokens_of_cp_sp_current[req_index] = req_state.num_computed_tokens_of_cp_sp_current
             self.input_batch.num_computed_tokens_of_cp_sp_accum[req_index] = req_state.num_computed_tokens_of_cp_sp_accum
+            logger.info(f"===============>{req_state.num_computed_tokens_of_cp_sp=} \n {req_state.num_computed_tokens_of_cp_sp_single=} \n {req_state.num_computed_tokens_of_cp_sp_current=} \n {req_state.num_computed_tokens_of_cp_sp_accum=}")
 
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
@@ -3785,7 +3786,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             cp_kv_recover_idx = torch.zeros(num_actual_tokens_cp_full,
                                             dtype=torch.int32,
                                             device=self.device)
-            logger.info(f"====>{self.cp_kv_recover_idx=}")
             cp_kv_recover_idx.copy_(torch.tensor(
                 np.array(self.cp_kv_recover_idx).flatten().tolist()),
                 non_blocking=True)
