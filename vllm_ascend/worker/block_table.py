@@ -318,7 +318,8 @@ class MultiGroupBlockTable:
 
     def get_split_computed_tokens(self, num_computed_tokens: np.ndarray,
                                 request_ids: Optional[List[str]] = None,
-                                request_start_rank_dict: Optional[Dict[str, int]] = None
+                                request_start_rank_dict: Optional[Dict[str, tuple[int,int]]] = None,    # tuple: start_rank, tokens_blank_in_this_block
+                                dispatch_size: int = 1,
                                 ) -> list[list[list[int]]]:
         """Splits computed token counts across dcp and sp dimensions for distributed allocation.
         
@@ -346,31 +347,56 @@ class MultiGroupBlockTable:
         for req_idx, (req_id, total_tokens) in enumerate(zip(request_ids, num_computed_tokens)):
             if total_tokens <= 0:
                 continue
-            base = int(total_tokens) // total_ranks
-            remainder = int(total_tokens) % total_ranks
             
             # Get starting rank for this chunk
             if request_start_rank_dict is not None:
-                start_rank = request_start_rank_dict.get(req_id, 0)
+                start_rank, tokens_blank = request_start_rank_dict.get(req_id, 0)
             else:
                 start_rank = 0
+                tokens_blank = 0
+            
+            if tokens_blank > 0:    # need to continue writing in the last block of previous chunk
+                consumed_tokens = min(tokens_blank, total_tokens)
+                total_tokens -= consumed_tokens
+                tokens_blank -= consumed_tokens
+                if tokens_blank == 0:
+                    start_rank = (start_rank+1) % total_ranks
+                else:
+                    cp_idx = start_rank // self.dcp_world_size
+                    sp_idx = start_rank % self.dcp_world_size
+                    num_computed_tokens_of_cp_dcp[req_idx][cp_idx][sp_idx] += consumed_tokens
+                    request_start_rank_dict[req_id] = (start_rank, tokens_blank)
+                    return num_computed_tokens_of_cp_dcp
+            
+            virtual_size = total_ranks * dispatch_size
+            base = int(total_tokens) // virtual_size
+            remainder = int(total_tokens) % virtual_size
+            remain_blocks = cdiv(remainder, dispatch_size)
             
             # Distribute base tokens to all ranks
             for rank_idx in range(total_ranks):
                 cp_idx = rank_idx // self.dcp_world_size
                 sp_idx = rank_idx % self.dcp_world_size
-                num_computed_tokens_of_cp_dcp[req_idx][cp_idx][sp_idx] = base
+                num_computed_tokens_of_cp_dcp[req_idx][cp_idx][sp_idx] = base * dispatch_size
 
             # Distribute remainder tokens starting from start_rank
-            for i in range(remainder):
+            for i in range(remain_blocks):
                 rank = (start_rank + i) % total_ranks
                 cp_idx = rank // self.dcp_world_size
                 sp_idx = rank % self.dcp_world_size
-                num_computed_tokens_of_cp_dcp[req_idx][cp_idx][sp_idx] += 1
+                if i < remain_blocks-1 or remainder % dispatch_size == 0:  # not last block or divisible
+                    num_computed_tokens_of_cp_dcp[req_idx][cp_idx][sp_idx] += 1 * dispatch_size
+                    tokens_blank = 0
+                else:   # if last block and undivisible
+                    num_computed_tokens_of_cp_dcp[req_idx][cp_idx][sp_idx] += remainder % dispatch_size
+                    tokens_blank = dispatch_size - (remainder % dispatch_size)
+            start_rank = (start_rank + remain_blocks) % total_ranks
+            if tokens_blank == 0:
+                start_rank = (start_rank + 1) % total_ranks
             
             # Update next starting rank for this request
             if request_start_rank_dict is not None:
-                request_start_rank_dict[req_id] = (start_rank + remainder) % total_ranks
+                    request_start_rank_dict[req_id] = (start_rank, tokens_blank)
             
         return num_computed_tokens_of_cp_dcp
 

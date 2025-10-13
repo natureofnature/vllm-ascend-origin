@@ -644,7 +644,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 num_computed_tokens = new_req_data.num_computed_tokens
                 if num_computed_tokens > 0:
                     # Initialize with starting rank 0
-                    temp_start_rank_dict = {req_id: 0}
+                    temp_start_rank_dict = {req_id: (0, 0)}
                     
                     # Compute token distribution for initial tokens
                     current_distribution = self.input_batch.block_table.get_split_computed_tokens(
@@ -654,7 +654,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     )[0]
                     
                     # Update next_cp_dcp_start_rank
-                    req_state.next_cp_dcp_start_rank = temp_start_rank_dict[req_id]
+                    req_state.next_cp_dcp_start_rank = temp_start_rank_dict[req_id][0]
+                    req_state.token_blank_in_last_blk = temp_start_rank_dict[req_id][1]
                     
                     req_state.num_computed_tokens_of_cp_sp = current_distribution
                     req_state.num_computed_tokens_of_cp_sp_current = current_distribution
@@ -706,7 +707,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 
                 if chunk_tokens > 0:
                     # Create a temporary dict with this request's starting rank
-                    temp_start_rank_dict = {req_id: req_state.next_cp_dcp_start_rank}
+                    temp_start_rank_dict = {req_id: (req_state.next_cp_dcp_start_rank, req_state.token_blank_in_last_blk)}
                     
                     # Compute distribution for this chunk only
                     chunk_distribution = self.input_batch.block_table.get_split_computed_tokens(
@@ -716,7 +717,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     )[0]
                     
                     # Update next_cp_dcp_start_rank for this request
-                    req_state.next_cp_dcp_start_rank = temp_start_rank_dict[req_id]
+                    req_state.next_cp_dcp_start_rank = temp_start_rank_dict[req_id][0]
+                    req_state.token_blank_in_last_blk = temp_start_rank_dict[req_id][1]
                     
                     # Save as current chunk distribution
                     req_state.num_computed_tokens_of_cp_sp_current = chunk_distribution
