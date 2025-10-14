@@ -5,6 +5,7 @@ from typing import (TYPE_CHECKING, ClassVar, NamedTuple, Optional, Tuple, Type,
 import numpy as np
 import torch
 import torch_npu
+import os, json, pickle
 from torch import nn
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -601,9 +602,98 @@ class AscendMLAImpl(MLAAttentionImpl):
         self.tp_group = get_tp_group(
         ).device_group if self.tp_size > 1 else None
 
-        # Step indices for chunked prefill tracking
+        
+        # Debug: assign a stable layer id per MLAImpl instance
+        if not hasattr(AscendMLAImpl, "_layer_id_counter"):
+            AscendMLAImpl._layer_id_counter = 0
+        self.layer_id = AscendMLAImpl._layer_id_counter
+        AscendMLAImpl._layer_id_counter += 1
+
+        # Load dump config once per process
+        if not hasattr(AscendMLAImpl, "_dump_cfg"):
+            AscendMLAImpl._dump_cfg = self._load_dump_cfg()
+        # Step index for chunked prefill dumps
         self._prefill_step_idx: int = 0
         self._decode_step_idx: int = 0
+
+    @classmethod
+    def _load_dump_cfg(cls) -> dict:
+        # File-based control to avoid relying on envs in worker
+        # Path is fixed to debug/dump_config.json
+        cfg_path = os.path.join("debug", "dump_config.json")
+        try:
+            if os.path.exists(cfg_path):
+                with open(cfg_path, "r") as f:
+                    cfg = json.load(f)
+                # sanitize
+                if not isinstance(cfg, dict):
+                    return {}
+                return cfg
+        except Exception:
+            pass
+        return {}
+
+    def _dump_enabled(self) -> bool:
+        cfg = getattr(AscendMLAImpl, "_dump_cfg", {})
+        if not cfg or not cfg.get("enabled", False):
+            return False
+        layers = cfg.get("layers")
+        if isinstance(layers, list) and len(layers) > 0:
+            try:
+                if self.layer_id not in [int(x) for x in layers]:
+                    return False
+            except Exception:
+                pass
+        cp_ranks = cfg.get("cp_ranks")
+        if isinstance(cp_ranks, list) and len(cp_ranks) > 0:
+            try:
+                if self.cp_rank not in [int(x) for x in cp_ranks]:
+                    return False
+            except Exception:
+                pass
+        return True
+
+    def _dump_dir(self) -> str:
+        cfg = getattr(AscendMLAImpl, "_dump_cfg", {})
+        return cfg.get("dir", os.path.join("debug", "compare"))
+
+    def _dump_kv_blocks(self) -> int:
+        cfg = getattr(AscendMLAImpl, "_dump_cfg", {})
+        try:
+            # 0 或未配置表示全部块
+            return int(cfg.get("kv_blocks", 0))
+        except Exception:
+            return 0
+
+    def _dump_out_tokens(self) -> int:
+        cfg = getattr(AscendMLAImpl, "_dump_cfg", {})
+        try:
+            # 0 或未配置表示全部 token
+            return int(cfg.get("out_tokens", 0))
+        except Exception:
+            return 0
+
+    def _maybe_dump_pickle(self, tag: str, payload: dict, step: int | None = None) -> None:
+        if not self._dump_enabled():
+            return
+        dump_dir = self._dump_dir()
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+        except Exception:
+            pass
+        tp_rank = get_tensor_model_parallel_rank() if self.sp_group else 0
+        step_seg = f"_step{int(step)}" if step is not None else ""
+        fname = f"{dump_dir}/layer{self.layer_id}_cp{self.cp_rank}_sp{tp_rank}{step_seg}_{tag}.pkl"
+        try:
+            with open(fname, "wb") as f:
+                pickle.dump(payload, f)
+            try:
+                from vllm.logger import logger as _vlog
+                _vlog.info(f"[DUMP] wrote {fname}")
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     def _v_up_proj(self, x):
         # Convert from (B, N, L) to (N, B, L)
@@ -867,28 +957,29 @@ class AscendMLAImpl(MLAAttentionImpl):
                             f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
 
                 # NOTE: Debug dump code commented out - requires _dump_enabled() and _maybe_dump_pickle() methods
-                # if self._dump_enabled():
-                #     _dump_step = self._prefill_step_idx
-                #     prefill_q_nope_0 = q_nope.detach().cpu().to(torch.float32)
-                #     prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
-                #     prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
-                #     prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
-                #     prefill_value_0 = v.detach().cpu().to(torch.float32)
-                #     prefill_block_table_0 = prefill_metadata.block_table.detach().cpu()
-                #     self._maybe_dump_pickle(
-                #         tag="kv_prefill_context_before_mla",
-                #         payload={
-                #             "layer_id": getattr(self, 'layer_id', -1),
-                #             "cp_rank": int(self.cp_rank),
-                #             "prefill_q_nope": prefill_q_nope_0.numpy(),
-                #             "prefill_q_pe": prefill_q_pe_0.numpy(),
-                #             "prefill_k_nope": prefill_k_nope_0.numpy(),
-                #             "prefill_k_pe": prefill_k_pe_0.numpy(),
-                #             "prefill_value": prefill_value_0.numpy(),
-                #             "prefill_block_table": prefill_block_table_0.numpy(),
-                #         },
-                #         step=_dump_step,
-                #     )
+                if self._dump_enabled():
+                     _dump_step = self._prefill_step_idx
+                     prefill_q_nope_0 = q_nope.detach().cpu().to(torch.float32)
+                     prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
+                     prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
+                     prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
+                     prefill_value_0 = v.detach().cpu().to(torch.float32)
+                     prefill_block_table_0 = prefill_metadata.block_table.detach().cpu()
+                     self._maybe_dump_pickle(
+                         tag=f"kv_prefill_context_before_mla_step_{_dump_step}",
+                         payload={
+                             "layer_id": getattr(self, 'layer_id', -1),
+                             "cp_rank": int(self.cp_rank),
+                             "prefill_q_nope": prefill_q_nope_0.numpy(),
+                             "prefill_q_pe": prefill_q_pe_0.numpy(),
+                             "prefill_k_nope": prefill_k_nope_0.numpy(),
+                             "prefill_k_pe": prefill_k_pe_0.numpy(),
+                             "prefill_value": prefill_value_0.numpy(),
+                             "prefill_block_table": prefill_block_table_0.numpy(),
+                             "seq_len":seq_len,
+                         },
+                         step=_dump_step,
+                     )
 
                 if seq_len2.item() > 0:
                     torch_npu.atb.npu_ring_mla(
@@ -1442,6 +1533,36 @@ class AscendMLAImpl(MLAAttentionImpl):
         tail_attn_nomask_seqlens = attn_metadata.prefill.tail_attn_nomask_seqlens
         mask = attn_metadata.prefill.cp_prefill_mask
 
+        
+        if self._dump_enabled():
+            _dump_step = self._prefill_step_idx
+            prefill_q_nope_0 = torch.index_select(q_nope, 0, q_head_idx).detach().cpu().to(torch.float32)
+            prefill_q_pe_0 = torch.index_select(q_pe, 0, q_head_idx).detach().cpu().to(torch.float32)
+            prefill_q_nope_1 = torch.index_select(q_nope, 0, q_tail_idx).detach().cpu().to(torch.float32)
+            prefill_q_pe_1 = torch.index_select(q_pe, 0, q_tail_idx).detach().cpu().to(torch.float32)
+            prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
+            prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
+            prefill_value_0 = value.detach().cpu().to(torch.float32)
+            kv_c_and_k_pe_cache_0 = kv_c_and_k_pe_cache[0].detach().cpu().to(torch.float32)
+            kv_c_and_k_pe_cache_1 = kv_c_and_k_pe_cache[1].detach().cpu().to(torch.float32)
+            self._maybe_dump_pickle(
+                tag=f"kv_prefill_causal_before_mla_step_{_dump_step}",
+                payload={
+                    "layer_id": self.layer_id,
+                    "cp_rank": int(self.cp_rank),
+                    "prefill_q_nope_top": prefill_q_nope_0.numpy(),
+                    "prefill_q_pe_top": prefill_q_pe_0.numpy(),
+                    "prefill_q_nope_head": prefill_q_nope_1.numpy(),
+                    "prefill_q_pe_head": prefill_q_pe_1.numpy(),
+                    "prefill_k_nope": prefill_k_nope_0.numpy(),
+                    "prefill_k_pe": prefill_k_pe_0.numpy(),
+                    "prefill_value": prefill_value_0.numpy(),
+                    "kv_c_and_k_pe_cache_0":kv_c_and_k_pe_cache_0.numpy(),
+                    "kv_c_and_k_pe_cache_1":kv_c_and_k_pe_cache_1.numpy(),
+                },
+                step=_dump_step,
+            )
+
         output_head, head_lse = self._attention_with_mask_and_nomask(
             q_nope=torch.index_select(q_nope, 0, q_head_idx),
             q_pe=torch.index_select(q_pe, 0, q_head_idx),
@@ -1603,6 +1724,33 @@ class AscendMLAImpl(MLAAttentionImpl):
             0, 1).to(torch.uint8).to(q_pe.device)
         seq_len = num_computed_tokens_of_cp_sp[:, self.cp_rank, self.dcp_rank]
         seq_len = torch.tensor(seq_len, dtype=torch.int32)
+
+        if self._dump_enabled():
+            _dump_step = self._decode_step_idx
+            prefill_q_nope_0 = q_nope.detach().cpu().to(torch.float32)
+            prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
+            prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
+            prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
+            prefill_value_0 = v.detach().cpu().to(torch.float32)
+            #kv_c_and_k_pe_cache_0 = kv_c_and_k_pe_cache[0].detach().cpu().to(torch.float32)
+            #kv_c_and_k_pe_cache_1 = kv_c_and_k_pe_cache[1].detach().cpu().to(torch.float32)
+            self._maybe_dump_pickle(
+                tag=f"kv_decode_before_mla_step_{_dump_step}",
+                payload={
+                    "layer_id": self.layer_id,
+                    "cp_rank": int(self.cp_rank),
+                    "prefill_q_nope_top": prefill_q_nope_0.numpy(),
+                    "prefill_q_pe_top": prefill_q_pe_0.numpy(),
+                    "prefill_k_nope": prefill_k_nope_0.numpy(),
+                    "prefill_k_pe": prefill_k_pe_0.numpy(),
+                    "prefill_value": prefill_value_0.numpy(),
+                    "seq_len":seq_len,
+                    "num_computed_tokens_of_cp_sp":num_computed_tokens_of_cp_sp,
+                    #"kv_c_and_k_pe_cache_0":kv_c_and_k_pe_cache_0.numpy(),
+                    #"kv_c_and_k_pe_cache_1":kv_c_and_k_pe_cache_1.numpy(),
+                },
+                step=_dump_step,
+            )
 
         if torch.sum(seq_len).item() == 0:
             # Case that no kv_cache has been stored on this rank, no need to do following computation.
