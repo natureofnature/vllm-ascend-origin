@@ -810,8 +810,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     value=k_pe,
                 )
 
-            seq_len = torch.stack([seq_len1.cpu(), seq_len2.cpu()])
-            logger.info(f'----> cp={self.cp_rank},dcp={self.dcp_rank},{seq_len2_all=},{total_toks=},{num_computed_tokens_of_cp_sp_accum=}')
+            # seq_len = torch.stack([seq_len1.cpu(), seq_len2.cpu()])
+            # logger.info(f'----> cp={self.cp_rank},dcp={self.dcp_rank},{seq_len2_all=},{total_toks=},{num_computed_tokens_of_cp_sp_accum=}')
 
             kv_c_normed = kv_c_normed.squeeze()
             if self.dcp_size > 1:
@@ -840,6 +840,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                     -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
                 k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
                 k_pe = k_pe_full.unsqueeze(1).expand((*k_nope.shape[:-1], -1))
+                
+                seq_len2.mul_(self.dcp_size)    # chunk len: seq/(cp*dcp) -> seq/cp
             else:
                 # Non-DCP mode: use TP-split projection
                 kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
@@ -847,6 +849,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                 k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
                 k_pe = k_pe.expand((*k_nope.shape[:-1], -1))
             
+            seq_len = torch.stack([seq_len1.cpu(), seq_len2.cpu()])
+            # logger.info(f">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> cp={self.cp_rank}, dcp={self.dcp_rank}, seq_len: {seq_len.tolist()} >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>")
             if self.cp_size > 1:
                 # CP+DCP mode: first compute this rank's contribution to the chunk
                 # Case that no kv_cache has been stored on this rank, no need to do following computation.
