@@ -878,7 +878,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                 "kv_c_normed":kv_c_normed_1,
                                 "k_pe":k_pe_1,
                                 "prefill_block_table":prefill_metadata.block_table,
-                                "seq_len2":seq_len2,
+                                "seq_len2":seq_len2_rank,
                                 "seq_starts":prefill_metadata.chunked_context.starts[i],
                                 "context_start_rank":context_starts_rank
                             },
