@@ -1395,7 +1395,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     _dump_step = self._prefill_step_idx
                     try:
                         prefill_slot_mapping = attn_metadata.slot_mapping.detach().cpu().to(torch.int32)
-                        value= k_pe.detach().cpu().to(torch.int32)
+                        value= k_pe.detach().cpu()
                         self._maybe_dump_pickle(
                             tag="attn_prefill_slot_mapping",
                             payload={
