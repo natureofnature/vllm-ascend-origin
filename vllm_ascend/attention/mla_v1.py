@@ -832,6 +832,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 ## DCP mode: each rank processes its own (cp,dcp) historical context slice per request dimension
                 seq_len2_all = prefill_metadata.chunked_context.chunk_seq_lens[i]
                 num_requests = len(seq_len2_all)
+                context_starts_rank= torch.zeros(num_requests, dtype=torch.int32)
 
                 ## Calculate tokens each rank should process per request
                 seq_len2_rank = torch.zeros(num_requests, dtype=torch.int32)
@@ -854,7 +855,6 @@ class AscendMLAImpl(MLAAttentionImpl):
                                        dtype=q_nope.dtype,
                                        device=q_nope.device)
                     #context_starts_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
-                    context_starts_rank= sum(num_computed_tokens_of_cp_sp_accum[:][:i][self.cp_rank][self.dcp_rank])
 
                     torch_npu.atb.npu_paged_cache_load(
                         cache_kv_c,
@@ -879,10 +879,13 @@ class AscendMLAImpl(MLAAttentionImpl):
                                 "k_pe":k_pe_1,
                                 "prefill_block_table":prefill_metadata.block_table,
                                 "seq_len2":seq_len2,
-                                "seq_starts":prefill_metadata.chunked_context.starts[i]
+                                "seq_starts":prefill_metadata.chunked_context.starts[i],
+                                "context_start_rank":context_starts_rank
                             },
                             step=_dump_step,
                         )
+                    for req_idx in range(num_requests):
+                        context_starts_rank[req_idx]+=num_computed_tokens_of_cp_sp_accum[req_idx][i][self.cp_rank][self.dcp_rank]
                     seq_len2 = seq_len2_rank.to(q_nope.device)
                 else:
                     # If current rank has no tokens to process, create empty tensors
