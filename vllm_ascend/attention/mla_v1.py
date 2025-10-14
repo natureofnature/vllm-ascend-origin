@@ -834,7 +834,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 num_requests = len(seq_len2_all)
 
                 ## Calculate tokens each rank should process per request
-                seq_len2_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
+                seq_len2_rank = torch.zeros_like(num_requests, dtype=torch.int32)
                 context_starts_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
                 total_toks = 0
 
@@ -905,7 +905,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     kv_c_normed_1 = kv_c_normed.detach().cpu().to(torch.float32)
                     k_pe_1= k_pe.detach().cpu().to(torch.float32)
                     self._maybe_dump_pickle(
-                        tag=f"kv_prefill_context_before_mla_step_{_dump_step}",
+                        tag=f"kv_prefill_context_before_dcp_all_gather_{_dump_step}",
                         payload={
                             "layer_id": getattr(self, 'layer_id', -1),
                             "cp_rank": int(self.cp_rank),
