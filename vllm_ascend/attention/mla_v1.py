@@ -908,20 +908,12 @@ class AscendMLAImpl(MLAAttentionImpl):
                 # DCP mode: first all_gather within DCP group, let each rank in CP group share complete sequence blocks
                 # Step 1: DCP all_gather latent
                 kv_c_k_pe_local = torch.cat([kv_c_normed, k_pe.squeeze()], dim=-1)  # [local_toks, latent_dim + rope_dim]
-                
-                # Step 2: use all_gather_into_tensor_uneven (gather + cat)
-                output_split_sizes = num_computed_tokens_of_cp_sp_accum[req_idx][i][self.cp_rank]       # need to know num tokens of each rank in dcp group before using all_gather_into_tensor_uneven
-                total_toks = sum(output_split_sizes)
-                latent_rope_dim = kv_c_k_pe_local.size(-1)
-                kv_c_k_pe_full = torch.empty((total_toks, latent_rope_dim), device=kv_c_k_pe_local.device, dtype=kv_c_k_pe_local.dtype)
-                
-                torch_npu.distributed.all_gather_into_tensor_uneven(
-                    kv_c_k_pe_full,
-                    kv_c_k_pe_local,
-                    output_split_sizes=output_split_sizes,
-                    group=self.dcp_group,
-                    async_op=False
-                )
+
+                kv_c_k_pe_gather_list = [torch.empty_like(kv_c_k_pe_local) for _ in range(self.dcp_size)]
+                dist.all_gather(kv_c_k_pe_gather_list, kv_c_k_pe_local, group=self.dcp_group)
+
+                # Step 2: concatenate all DCP ranks' data in sequence dimension
+                kv_c_k_pe_full = torch.cat(kv_c_k_pe_gather_list, dim=0)  # [total_dcp_toks, latent_dim + rope_dim]
 
                 kv_c_normed_full, k_pe_full = torch.split(kv_c_k_pe_full, [latent_kv_dim, rope_dim], dim=-1)
 
@@ -930,6 +922,31 @@ class AscendMLAImpl(MLAAttentionImpl):
                     -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
                 k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
                 k_pe = k_pe_full.unsqueeze(1).expand((*k_nope.shape[:-1], -1))
+                ## DCP mode: first all_gather within DCP group, let each rank in CP group share complete sequence blocks
+                ## Step 1: DCP all_gather latent
+                #kv_c_k_pe_local = torch.cat([kv_c_normed, k_pe.squeeze()], dim=-1)  # [local_toks, latent_dim + rope_dim]
+                
+                ## Step 2: use all_gather_into_tensor_uneven (gather + cat)
+                #output_split_sizes = num_computed_tokens_of_cp_sp_accum[req_idx][i][self.cp_rank]       # need to know num tokens of each rank in dcp group before using all_gather_into_tensor_uneven
+                #total_toks = sum(output_split_sizes)
+                #latent_rope_dim = kv_c_k_pe_local.size(-1)
+                #kv_c_k_pe_full = torch.empty((total_toks, latent_rope_dim), device=kv_c_k_pe_local.device, dtype=kv_c_k_pe_local.dtype)
+                
+                #torch_npu.distributed.all_gather_into_tensor_uneven(
+                #    kv_c_k_pe_full,
+                #    kv_c_k_pe_local,
+                #    output_split_sizes=output_split_sizes,
+                #    group=self.dcp_group,
+                #    async_op=False
+                #)
+
+                #kv_c_normed_full, k_pe_full = torch.split(kv_c_k_pe_full, [latent_kv_dim, rope_dim], dim=-1)
+
+                ## Step 3: process complete sequence with TP projection to get current rank's head slice
+                #kv_nope = self.kv_b_proj(kv_c_normed_full)[0].view(
+                #    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
+                #k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+                #k_pe = k_pe_full.unsqueeze(1).expand((*k_nope.shape[:-1], -1))
                 
                 seq_len2.mul_(self.dcp_size)    # chunk len: seq/(cp*dcp) -> seq/cp
             else:
