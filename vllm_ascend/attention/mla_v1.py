@@ -681,7 +681,7 @@ class AscendMLAImpl(MLAAttentionImpl):
             os.makedirs(dump_dir, exist_ok=True)
         except Exception:
             pass
-        tp_rank = get_tensor_model_parallel_rank() if self.sp_group else 0
+        tp_rank = get_tensor_model_parallel_rank()
         step_seg = f"_step{int(step)}" if step is not None else ""
         fname = f"{dump_dir}/layer{self.layer_id}_cp{self.cp_rank}_sp{tp_rank}{step_seg}_{tag}.pkl"
         try:
