@@ -835,7 +835,6 @@ class AscendMLAImpl(MLAAttentionImpl):
 
                 ## Calculate tokens each rank should process per request
                 seq_len2_rank = torch.zeros(num_requests, dtype=torch.int32)
-                context_starts_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
                 total_toks = 0
 
                 for req_idx in range(num_requests):
@@ -854,7 +853,8 @@ class AscendMLAImpl(MLAAttentionImpl):
                                        rope_dim,
                                        dtype=q_nope.dtype,
                                        device=q_nope.device)
-                    seq_real_len = sum(num_computed_tokens_of_cp_sp_accum[:i][self.cp_rank][self.dcp_rank])
+                    #context_starts_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
+                    context_starts_rank= sum(num_computed_tokens_of_cp_sp_accum[:][:i][self.cp_rank][self.dcp_rank])
 
                     torch_npu.atb.npu_paged_cache_load(
                         cache_kv_c,
@@ -865,6 +865,24 @@ class AscendMLAImpl(MLAAttentionImpl):
                         key=kv_c_normed,
                         value=k_pe,
                     )
+                    
+                    if self._dump_enabled():
+                        _dump_step = self._prefill_step_idx
+                        kv_c_normed_1 = kv_c_normed.detach().cpu().to(torch.float32)
+                        k_pe_1= k_pe.detach().cpu().to(torch.float32)
+                        self._maybe_dump_pickle(
+                            tag=f"kv_prefill_context_before_dcp_all_gather_{_dump_step}",
+                            payload={
+                                "layer_id": getattr(self, 'layer_id', -1),
+                                "cp_rank": int(self.cp_rank),
+                                "kv_c_normed":kv_c_normed_1,
+                                "k_pe":k_pe_1,
+                                "prefill_block_table":prefill_metadata.block_table,
+                                "seq_len2":seq_len2,
+                                "seq_starts":prefill_metadata.chunked_context.starts[i]
+                            },
+                            step=_dump_step,
+                        )
                     seq_len2 = seq_len2_rank.to(q_nope.device)
                 else:
                     # If current rank has no tokens to process, create empty tensors
@@ -901,23 +919,6 @@ class AscendMLAImpl(MLAAttentionImpl):
                     value=k_pe,
                 )
 
-                if self._dump_enabled():
-                    _dump_step = self._prefill_step_idx
-                    kv_c_normed_1 = kv_c_normed.detach().cpu().to(torch.float32)
-                    k_pe_1= k_pe.detach().cpu().to(torch.float32)
-                    self._maybe_dump_pickle(
-                        tag=f"kv_prefill_context_before_dcp_all_gather_{_dump_step}",
-                        payload={
-                            "layer_id": getattr(self, 'layer_id', -1),
-                            "cp_rank": int(self.cp_rank),
-                            "kv_c_normed":kv_c_normed_1,
-                            "k_pe":k_pe_1,
-                            "prefill_block_table":prefill_metadata.block_table,
-                            "seq_len2":seq_len2,
-                            "seq_starts":prefill_metadata.chunked_context.starts[i]
-                        },
-                        step=_dump_step,
-                    )
 
             # seq_len = torch.stack([seq_len1.cpu(), seq_len2.cpu()])
             # logger.info(f'----> cp={self.cp_rank},dcp={self.dcp_rank},{seq_len2_all=},{total_toks=},{num_computed_tokens_of_cp_sp_accum=}')
