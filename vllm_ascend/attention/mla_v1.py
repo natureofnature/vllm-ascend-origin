@@ -1731,7 +1731,6 @@ class AscendMLAImpl(MLAAttentionImpl):
             prefill_q_pe_0 = q_pe.detach().cpu().to(torch.float32)
             prefill_k_nope_0 = k_nope.detach().cpu().to(torch.float32)
             prefill_k_pe_0 = k_pe.detach().cpu().to(torch.float32)
-            prefill_value_0 = v.detach().cpu().to(torch.float32)
             #kv_c_and_k_pe_cache_0 = kv_c_and_k_pe_cache[0].detach().cpu().to(torch.float32)
             #kv_c_and_k_pe_cache_1 = kv_c_and_k_pe_cache[1].detach().cpu().to(torch.float32)
             self._maybe_dump_pickle(
@@ -1743,7 +1742,6 @@ class AscendMLAImpl(MLAAttentionImpl):
                     "prefill_q_pe_top": prefill_q_pe_0.numpy(),
                     "prefill_k_nope": prefill_k_nope_0.numpy(),
                     "prefill_k_pe": prefill_k_pe_0.numpy(),
-                    "prefill_value": prefill_value_0.numpy(),
                     "seq_len":seq_len,
                     "num_computed_tokens_of_cp_sp":num_computed_tokens_of_cp_sp,
                     #"kv_c_and_k_pe_cache_0":kv_c_and_k_pe_cache_0.numpy(),
