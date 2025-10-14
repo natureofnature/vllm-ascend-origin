@@ -834,7 +834,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 num_requests = len(seq_len2_all)
 
                 ## Calculate tokens each rank should process per request
-                seq_len2_rank = torch.zeros_like(num_requests, dtype=torch.int32)
+                seq_len2_rank = torch.zeros(num_requests, dtype=torch.int32)
                 context_starts_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
                 total_toks = 0
 
@@ -854,6 +854,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                                        rope_dim,
                                        dtype=q_nope.dtype,
                                        device=q_nope.device)
+                    seq_real_len = sum(num_computed_tokens_of_cp_sp_accum[:i][self.cp_rank][self.dcp_rank])
 
                     torch_npu.atb.npu_paged_cache_load(
                         cache_kv_c,
