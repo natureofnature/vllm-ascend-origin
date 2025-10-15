@@ -736,16 +736,18 @@ class AscendMLAImpl(MLAAttentionImpl):
         logger.info(f"===> in chunked prefill ###, {num_computed_tokens_of_cp_sp_accum=}")
         logger.info(f"===> in chunked prefill ===, {attn_metadata.prefill.num_computed_tokens_of_cp_sp=}")
         logger.info(f"===> in chunked prefill +++, {attn_metadata.prefill.num_computed_tokens_of_cp_sp_single=}")
+        context_starts_rank = None
 
         for i in range(iters):
             if self.cp_size * self.dcp_size > 1:
                 ## DCP mode: each rank processes its own (cp,dcp) historical context slice per request dimension
                 seq_len2_all = prefill_metadata.chunked_context.chunk_seq_lens[i]
                 num_requests = len(seq_len2_all)
+                # Before dealing with a new chunk, set to zero, and accumulate the start positions as chunk prefill step increases
+                context_starts_rank= torch.zeros(num_requests, dtype=torch.int32) if context_starts_rank is None else context_starts_rank
 
                 ## Calculate tokens each rank should process per request
                 seq_len2_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
-                context_starts_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
                 total_toks = 0
 
                 for req_idx in range(num_requests):
@@ -770,7 +772,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                         cache_k_pe,
                         prefill_metadata.block_table,
                         seq_len2_rank.to(q_nope.device),
-                        seq_starts=prefill_metadata.chunked_context.starts[i],
+                        seq_starts=context_starts_rank, #slot offsets of current chunk in current iteration
                         key=kv_c_normed,
                         value=k_pe,
                     )
@@ -782,6 +784,10 @@ class AscendMLAImpl(MLAAttentionImpl):
                     k_pe = torch.empty(0, num_heads, rope_dim,
                                        dtype=q_nope.dtype, device=q_nope.device)
                     seq_len2 = torch.zeros((len(seq_len2_all),), dtype=torch.int32, device=q_nope.device)
+
+                for req_idx in range(num_requests):
+                    # Before dealing with a new chunk, set to zero, and accumulate the start positions as chunk prefill step increases
+                    context_starts_rank[req_idx]+=num_computed_tokens_of_cp_sp_accum[req_idx][i][self.cp_rank][self.dcp_rank]
             else:
                 # Original logic: CP-only mode
                 toks = prefill_metadata.chunked_context.seq_tot[i]
