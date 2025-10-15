@@ -1412,26 +1412,28 @@ class AscendMLAImpl(MLAAttentionImpl):
                 prefill_k_c_normed, prefill_k_pe = prefill_kv_c_k_pe.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
                 kv_c_normed, k_pe = prefill_k_c_normed, prefill_k_pe
-                prefill_k_c_normed = prefill_k_c_normed.squeeze()
 
                 if self._dump_enabled():
                     _dump_step = self._prefill_step_idx
                     try:
                         prefill_slot_mapping = attn_metadata.slot_mapping.detach().cpu().to(torch.int32)
                         value= k_pe.detach().cpu().to(torch.float32)
+                        kvc_normed = prefill_k_c_normed.cpu().to(torch.floa32)
                         self._maybe_dump_pickle(
                             tag="attn_prefill_slot_mapping",
                             payload={
                                 "layer_id": self.layer_id,
                                 "cp_rank": int(self.cp_rank),
                                 "decode_slots":prefill_slot_mapping.numpy(),
-                                "prefill_value":value
+                                "prefill_value":value,
+                                "prefill_k_c_normed":kvc_normed
                             },
                             step=_dump_step,
                         )
                     except Exception:
                         pass
 
+                prefill_k_c_normed = prefill_k_c_normed.squeeze()
 
                 torch_npu._npu_reshape_and_cache(
                     key=kv_c_normed,
