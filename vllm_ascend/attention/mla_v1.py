@@ -940,6 +940,23 @@ class AscendMLAImpl(MLAAttentionImpl):
 
                 kv_c_normed_full, k_pe_full = torch.split(kv_c_k_pe_full, [latent_kv_dim, rope_dim], dim=-1)
 
+                
+
+                if self._dump_enabled():
+                    _dump_step = self._prefill_step_idx
+                    kv_c_normed_1 = kv_c_normed_full.detach().cpu().to(torch.float32)
+                    k_pe_1= k_pe_full.detach().cpu().to(torch.float32)
+                    self._maybe_dump_pickle(
+                        tag=f"kv_prefill_context_after_dcp_all_gather_{_dump_step}",
+                        payload={
+                            "layer_id": getattr(self, 'layer_id', -1),
+                            "cp_rank": int(self.cp_rank),
+                            "kv_c_normed":kv_c_normed_1,
+                            "k_pe":k_pe_1,
+                        },
+                        step=_dump_step,
+                    )
+
                 # Step 3: process complete sequence with TP projection to get current rank's head slice
                 kv_nope = self.kv_b_proj(kv_c_normed_full)[0].view(
                     -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
