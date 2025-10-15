@@ -826,13 +826,13 @@ class AscendMLAImpl(MLAAttentionImpl):
         logger.info(f"===> in chunked prefill ###, {num_computed_tokens_of_cp_sp_accum=}")
         logger.info(f"===> in chunked prefill ===, {attn_metadata.prefill.num_computed_tokens_of_cp_sp=}")
         logger.info(f"===> in chunked prefill +++, {attn_metadata.prefill.num_computed_tokens_of_cp_sp_single=}")
+        context_starts_rank= torch.zeros(num_requests, dtype=torch.int32)
 
         for i in range(iters):
             if self.cp_size * self.dcp_size > 1:
                 ## DCP mode: each rank processes its own (cp,dcp) historical context slice per request dimension
                 seq_len2_all = prefill_metadata.chunked_context.chunk_seq_lens[i]
                 num_requests = len(seq_len2_all)
-                context_starts_rank= torch.zeros(num_requests, dtype=torch.int32)
 
                 ## Calculate tokens each rank should process per request
                 seq_len2_rank = torch.zeros(num_requests, dtype=torch.int32)
@@ -854,7 +854,6 @@ class AscendMLAImpl(MLAAttentionImpl):
                                        rope_dim,
                                        dtype=q_nope.dtype,
                                        device=q_nope.device)
-                    #context_starts_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
 
                     torch_npu.atb.npu_paged_cache_load(
                         cache_kv_c,
@@ -933,7 +932,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 kv_c_k_pe_local = torch.cat([kv_c_normed, k_pe.squeeze()], dim=-1)  # [local_toks, latent_dim + rope_dim]
 
                 kv_c_k_pe_gather_list = [torch.empty_like(kv_c_k_pe_local) for _ in range(self.dcp_size)]
-                dist.all_gather(kv_c_k_pe_gather_list, kv_c_k_pe_local, group=self.dcp_group)
+                dist.all_gather(kv_c_k_pe_gather_list, kv_c_k_pe_local, group=self.tp_group)
 
                 # Step 2: concatenate all DCP ranks' data in sequence dimension
                 kv_c_k_pe_full = torch.cat(kv_c_k_pe_gather_list, dim=0)  # [total_dcp_toks, latent_dim + rope_dim]
@@ -1418,7 +1417,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                     _dump_step = self._prefill_step_idx
                     try:
                         prefill_slot_mapping = attn_metadata.slot_mapping.detach().cpu().to(torch.int32)
-                        value= k_pe.detach().cpu()
+                        value= k_pe.detach().cpu().to(torch.float32)
                         self._maybe_dump_pickle(
                             tag="attn_prefill_slot_mapping",
                             payload={
