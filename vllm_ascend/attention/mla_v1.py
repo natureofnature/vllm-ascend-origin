@@ -826,13 +826,14 @@ class AscendMLAImpl(MLAAttentionImpl):
         logger.info(f"===> in chunked prefill ###, {num_computed_tokens_of_cp_sp_accum=}")
         logger.info(f"===> in chunked prefill ===, {attn_metadata.prefill.num_computed_tokens_of_cp_sp=}")
         logger.info(f"===> in chunked prefill +++, {attn_metadata.prefill.num_computed_tokens_of_cp_sp_single=}")
-        context_starts_rank= torch.zeros(num_requests, dtype=torch.int32)
+        context_starts_rank = None
 
         for i in range(iters):
             if self.cp_size * self.dcp_size > 1:
                 ## DCP mode: each rank processes its own (cp,dcp) historical context slice per request dimension
                 seq_len2_all = prefill_metadata.chunked_context.chunk_seq_lens[i]
                 num_requests = len(seq_len2_all)
+                context_starts_rank= torch.zeros(num_requests, dtype=torch.int32) if context_starts_rank is None else context_starts_rank
 
                 ## Calculate tokens each rank should process per request
                 seq_len2_rank = torch.zeros(num_requests, dtype=torch.int32)
