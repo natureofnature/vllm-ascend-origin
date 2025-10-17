@@ -699,7 +699,7 @@ class AscendMLAImpl(MLAAttentionImpl):
 
         iters = len(prefill_metadata.chunked_context.seq_tot)
 
-        seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32)
+        # seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32)
         cache_kv_c = kv_c_and_k_pe_cache[0]
         cache_k_pe = kv_c_and_k_pe_cache[1]
         num_heads = cache_k_pe.size(2)
@@ -707,6 +707,8 @@ class AscendMLAImpl(MLAAttentionImpl):
         # token -> request mapping for building per-token masks when CP>1
         num_tokens_all = q_nope.size(0)
         seq_len1 = torch.tensor(prefill_metadata.query_lens, dtype=torch.int32, device=q_nope.device).contiguous()
+        # logger.info(f"seq_len1: {seq_len1}")
+        seq_len1.mul_(self.cp_size)    # q_full
 
         # normalize prefix LSE to [bs, heads, 1] for stable updates
         prefix_lse_bt = prefix_lse.permute(1, 0).unsqueeze(-1).contiguous() if prefix_lse is not None else None
@@ -722,20 +724,20 @@ class AscendMLAImpl(MLAAttentionImpl):
         if attn_metadata is not None and attn_metadata.prefill is not None and \
                 attn_metadata.prefill.cp_prefill_mask is not None:
             mask_local = attn_metadata.prefill.cp_prefill_mask
-            logger.info(f"||||||====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
+            # logger.info(f"||||||====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
         else:
             mask_local = self.prefill_mask
             if mask_local is None:
                 mask_local = torch.triu(
                     torch.ones(512, 512, device=q_nope.device, dtype=q_nope.dtype), 1)
                 self.prefill_mask = mask_local
-            logger.info(f"+++++++====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
+            # logger.info(f"+++++++====> mask shape:{mask_local.shape}, mask_local: \n{mask_local}")
 
         # Keep the causal mask; do not override to all-ones.
         num_computed_tokens_of_cp_sp_accum = attn_metadata.prefill.num_computed_tokens_of_cp_sp_accum
-        logger.info(f"===> in chunked prefill ###, {num_computed_tokens_of_cp_sp_accum=}")
-        logger.info(f"===> in chunked prefill ===, {attn_metadata.prefill.num_computed_tokens_of_cp_sp=}")
-        logger.info(f"===> in chunked prefill +++, {attn_metadata.prefill.num_computed_tokens_of_cp_sp_single=}")
+        # logger.info(f"===> in chunked prefill ###, {num_computed_tokens_of_cp_sp_accum=}")
+        # logger.info(f"===> in chunked prefill ===, {attn_metadata.prefill.num_computed_tokens_of_cp_sp=}")
+        # logger.info(f"===> in chunked prefill +++, {attn_metadata.prefill.num_computed_tokens_of_cp_sp_single=}")
         context_starts_rank = None
 
         for i in range(iters):
@@ -744,7 +746,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                 seq_len2_all = prefill_metadata.chunked_context.chunk_seq_lens[i]
                 num_requests = len(seq_len2_all)
                 # Before dealing with a new chunk, set to zero, and accumulate the start positions as chunk prefill step increases
-                context_starts_rank= torch.zeros(num_requests, dtype=torch.int32) if context_starts_rank is None else context_starts_rank
+                context_starts_rank= torch.zeros(num_requests, dtype=torch.int32, device=q_nope.device) if context_starts_rank is None else context_starts_rank
 
                 ## Calculate tokens each rank should process per request
                 seq_len2_rank = torch.zeros_like(seq_len2_all, dtype=torch.int32)
@@ -868,9 +870,9 @@ class AscendMLAImpl(MLAAttentionImpl):
                                             float('-inf'),
                                             dtype=torch.float32,
                                             device=q_nope.device)
-                logger.info(f"--->here---,cp={self.cp_rank},dcp={self.dcp_rank}, cache_kv_c.shape:{cache_kv_c.shape},cache_k_pe.shape:{cache_k_pe.shape}, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
-                            f"value:{v.shape}, seq_len:{seq_len.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
-                            f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
+                # logger.info(f"--->here---,cp={self.cp_rank},dcp={self.dcp_rank}, cache_kv_c.shape:{cache_kv_c.shape},cache_k_pe.shape:{cache_k_pe.shape}, q_node:{q_nope.shape}, q_rope:{q_pe.shape}, k_nope:{k_nope.shape},k_rope:{k_pe.shape},"
+                #             f"value:{v.shape}, seq_len:{seq_len.shape}, head_num:{self.num_heads}, kv_head_num:{self.num_heads},"
+                #             f"qk_scale:{self.scale},out:{block_out_local.shape}, softmax_lse:{block_lse_local.shape}")
 
                 # NOTE: Debug dump code commented out - requires _dump_enabled() and _maybe_dump_pickle() methods
                 # if self._dump_enabled():
@@ -916,7 +918,7 @@ class AscendMLAImpl(MLAAttentionImpl):
                         softmax_lse=block_lse_local)
 
                 # CP dimension fusion (SP already handled above)
-                logger.debug(f"block_out_local shape:{block_out_local.shape}, block_lse_local shape:{block_lse_local.shape}")
+                # logger.debug(f"block_out_local shape:{block_out_local.shape}, block_lse_local shape:{block_lse_local.shape}")
 
                 block_lse_local_bt = block_lse_local.permute(1, 0).unsqueeze(-1)
                 out_lse_local = torch.cat([block_out_local, block_lse_local_bt], dim=-1)
@@ -932,19 +934,22 @@ class AscendMLAImpl(MLAAttentionImpl):
                     token_mask = torch.ones([out_r.size(0)], dtype=torch.uint8, device=out_r.device)
                     chunk_out_g, chunk_lse_g = self._update_out_and_lse(
                         chunk_out_g, chunk_lse_g, out_r, lse_r, token_mask)
-                
+                    
+                chunk_out_g = chunk_out_g[self.cp_rank*(num_tokens_all//self.cp_size):(self.cp_rank+1)*(num_tokens_all//self.cp_size)]     # pick q result of cp rank
+                chunk_lse_g = chunk_lse_g[self.cp_rank*(num_tokens_all//self.cp_size):(self.cp_rank+1)*(num_tokens_all//self.cp_size)]
                 if chunk_out_g is not None:
                     if prefix_lse_bt is None:
                         prefix_output = chunk_out_g.to(torch.float32)
                         prefix_lse_bt = chunk_lse_g
                     else:
-                        logger.info(f"--->here, chunk shape:{chunk_out_g.shape},{chunk_lse_g.shape}, prefix shape:{prefix_output.shape},{prefix_lse_bt.shape}")
-
+                        # logger.info(f"--->here, chunk shape:{chunk_out_g.shape},{chunk_lse_g.shape}, prefix shape:{prefix_output.shape},{prefix_lse_bt.shape}")
+                        chunk_out_g = self.pad_to_match(chunk_out_g, prefix_output)
+                        chunk_lse_g = self.pad_to_match(chunk_lse_g, prefix_lse_bt)
                         prefix_output, prefix_lse_bt = self._update_out_and_lse(
                             prefix_output, prefix_lse_bt, chunk_out_g, chunk_lse_g)
-                logger.info(
-                    f"#####> [MLA-CTX-CP] it={i}  q_nope.shape={q_nope.shape} k_nope.shape={k_nope.shape} "
-                    f"v.shape={v.shape} out_local.shape={block_out_local.shape} lse_local.shape={block_lse_local.shape}")
+                # logger.info(
+                #     f"#####> [MLA-CTX-CP] it={i}  q_nope.shape={q_nope.shape} k_nope.shape={k_nope.shape} "
+                #     f"v.shape={v.shape} out_local.shape={block_out_local.shape} lse_local.shape={block_lse_local.shape}")
 
             else:
                 # compute this chunk block then update prefix tensors to keep shapes consistent
@@ -980,13 +985,29 @@ class AscendMLAImpl(MLAAttentionImpl):
                 else:
                     prefix_output, prefix_lse_bt = self._update_out_and_lse(
                         prefix_output, prefix_lse_bt, block_out_local2, block_lse_local_bt2)
-                logger.info(
-                    f"#####> [MLA-CTX] it={i} toks={toks} q_nope.shape={q_nope.shape} k_nope.shape={k_nope.shape} v.shape={v.shape} "
-                    f"prefix_out.shape={prefix_output.shape} prefix_lse.shape={prefix_lse_bt.shape}")
+                # logger.info(
+                #     f"#####> [MLA-CTX] it={i} toks={toks} q_nope.shape={q_nope.shape} k_nope.shape={k_nope.shape} v.shape={v.shape} "
+                #     f"prefix_out.shape={prefix_output.shape} prefix_lse.shape={prefix_lse_bt.shape}")
         # convert lse back to [heads, bs]
         if prefix_lse_bt is not None:
             prefix_lse = prefix_lse_bt.squeeze(-1).permute(1, 0).contiguous()
         return prefix_output, prefix_lse
+
+    def pad_to_match(self, A: torch.Tensor, B: torch.Tensor, value: float = 0.0):
+        # check dimension
+        if A.dim() != B.dim():
+            raise ValueError("A and B dimension must be consistent")
+        elif A.shape == B.shape:
+            return A
+
+        pad_sizes = []
+        for i in reversed(range(A.dim())):
+            diff = B.size(i) - A.size(i)
+            if diff < 0:
+                raise ValueError(f"A's dimension {i} is larger than B, cannot pad")
+            pad_sizes.extend([0, diff])  # pad on right
+
+        return F.pad(A, pad_sizes, value=value)
 
     def _forward_prefill(
         self,
@@ -1483,10 +1504,22 @@ class AscendMLAImpl(MLAAttentionImpl):
         # Post-processing: keep [tokens, H, V] shape and perform chunked context accumulation if needed
         if attn_metadata.prefill is not None and \
                 attn_metadata.prefill.chunked_context is not None:
+            # q all_gather
+            # logger.info(f"q_nope.shape: {q_nope.shape}, q_pe.shape: {q_pe.shape}")
+            # torch.npu.synchronize()
+            q_nope_full = get_cp_group().all_gather(q_nope.contiguous(), 0)
+            # torch.npu.synchronize()
+            q_pe_full = get_cp_group().all_gather(q_pe.contiguous(), 0)
+            # torch.npu.synchronize()
+            q_nope_full = torch.index_select(q_nope_full, 0, attn_metadata.prefill.cp_kv_recover_idx)
+            q_pe_full = torch.index_select(q_pe_full, 0, attn_metadata.prefill.cp_kv_recover_idx)
+            # if self.cp_rank == 0 and self.dcp_rank == 0:
+            #     logger.info(f"cp_kv_recover_idx: {attn_metadata.prefill.cp_kv_recover_idx}")
+            # logger.info(f"q_nope_full.shape: {q_nope_full.shape}, q_pe_full.shape: {q_pe_full.shape}")
             attn_output_pre = output.view(num_tokens, self.num_heads, self.v_head_dim)
             attn_output_pre, attn_lse = self._compute_prefill_context(
-                q_nope,
-                q_pe,
+                q_nope_full,
+                q_pe_full,
                 kv_c_and_k_pe_cache,
                 self.qk_rope_head_dim,
                 attn_metadata,
@@ -1599,7 +1632,7 @@ class AscendMLAImpl(MLAAttentionImpl):
         # use cp & sp split computed token nums from scheduler to compute actual seq_len and seq_mask
         num_computed_tokens_of_cp_sp = np.array(
             decode_meta.num_computed_tokens_of_cp_sp)  # [bs, cp_size, sp_size]
-        logger.info(f"===> in decode, {num_computed_tokens_of_cp_sp=}")
+        # logger.info(f"===> in decode, {num_computed_tokens_of_cp_sp=}")
         seq_mask_cp = torch.where(
             torch.tensor(num_computed_tokens_of_cp_sp.sum(2)) == 0, 0,
             1).to(torch.uint8).to(q_pe.device)

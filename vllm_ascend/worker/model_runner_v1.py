@@ -786,7 +786,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             self.input_batch.num_computed_tokens_of_cp_sp_single[req_index] = req_state.num_computed_tokens_of_cp_sp_single
             self.input_batch.num_computed_tokens_of_cp_sp_current[req_index] = req_state.num_computed_tokens_of_cp_sp_current
             self.input_batch.num_computed_tokens_of_cp_sp_accum[req_index] = req_state.num_computed_tokens_of_cp_sp_accum
-            logger.info(f"===============>{req_state.num_computed_tokens_of_cp_sp=} \n {req_state.num_computed_tokens_of_cp_sp_single=} \n {req_state.num_computed_tokens_of_cp_sp_current=} \n {req_state.num_computed_tokens_of_cp_sp_accum=}")
+            # logger.info(f"===============>{req_state.num_computed_tokens_of_cp_sp=} \n {req_state.num_computed_tokens_of_cp_sp_single=} \n {req_state.num_computed_tokens_of_cp_sp_current=} \n {req_state.num_computed_tokens_of_cp_sp_accum=}")
 
             # For the last rank, we don't need to update the token_ids_cpu
             # because the sampled tokens are already cached.
@@ -1346,7 +1346,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
-        logger.info(f"**** number of scheduled tokens: {total_num_scheduled_tokens}****")
+        # logger.info(f"**** number of scheduled tokens: {total_num_scheduled_tokens}****")
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
@@ -3755,7 +3755,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     num_computed_tokens,
                     self.cp_kv_recover_idx)
                 num_tokens = len(req_position_cp)
-                logger.info(f"==> update tokens for cp, {num_tokens=},{self.input_batch.num_computed_tokens_cpu[i]=}")
+                # logger.info(f"==> update tokens for cp, {num_tokens=},{self.input_batch.num_computed_tokens_cpu[i]=}")
                 self.position_cp[start_index:start_index +
                                              num_tokens] = req_position_cp
                 start_index += num_tokens
